@@ -706,6 +706,481 @@ def merge_short_segments(segments, load_values, min_segment_length=8):
     
     return merged
 
+def explain_load_changes(segments, feat_df, pred_times, load_values):
+    """
+    负荷变化可解释性模型 - 分析负荷阶段变化的原因
+    
+    参数:
+    - segments: 负荷分段信息 [(start_idx, end_idx, state, mean_load), ...]
+    - feat_df: 特征数据框
+    - pred_times: 预测时间点列表
+    - load_values: 负荷值数组
+    
+    返回:
+    - explanations: 包含各阶段变化解释的字典
+    """
+    try:
+        explanations = {
+            'segment_analysis': [],
+            'trend_analysis': {},
+            'feature_importance': {},
+            'environmental_impact': {}
+        }
+        
+        # 检查可用的环境特征
+        env_features = ['temperature', 'humidity', 'visibility', 'pressure', 'windSpeed', 'cloudCover', 'dewPoint']
+        available_env_features = []
+        for feat in env_features:
+            if f'{feat}_current' in feat_df.columns:
+                available_env_features.append(feat)
+        
+        # 1. 逐段分析负荷特征和变化原因
+        for i, (start_idx, end_idx, state, mean_load) in enumerate(segments):
+            segment_info = {
+                'segment_id': i + 1,
+                'start_time': start_idx * 15 / 60,  # 转换为小时
+                'end_time': (end_idx + 1) * 15 / 60,
+                'duration_hours': (end_idx - start_idx + 1) * 15 / 60,
+                'state': int(state),
+                'mean_load': float(mean_load),
+                'load_level': '',
+                'key_factors': []
+            }
+            
+            # 确定负荷水平类别
+            all_segment_means = [seg[3] for seg in segments]
+            load_percentile = (sorted(all_segment_means).index(mean_load) + 1) / len(all_segment_means)
+            
+            if load_percentile <= 0.25:
+                segment_info['load_level'] = '低负荷'
+            elif load_percentile <= 0.5:
+                segment_info['load_level'] = '中低负荷'
+            elif load_percentile <= 0.75:
+                segment_info['load_level'] = '中高负荷'
+            else:
+                segment_info['load_level'] = '高负荷'
+            
+            # 提取该段的特征数据（如果时间对齐）
+            if pred_times and len(pred_times) > end_idx:
+                try:
+                    # 获取该段时间范围内的特征数据
+                    segment_times = pred_times[start_idx:end_idx+1]
+                    
+                    # 查找特征数据中对应的时间点
+                    matching_features = []
+                    for t in segment_times:
+                        # 找到最接近的特征数据时间点
+                        idx = feat_df.index.get_indexer([t], method='nearest')[0]
+                        if 0 <= idx < len(feat_df):
+                            matching_features.append(feat_df.iloc[idx])
+                    
+                    if matching_features:
+                        # 计算该段的平均特征值
+                        segment_features = pd.DataFrame(matching_features)
+                        
+                        # 分析环境因素的影响
+                        for env_feat in available_env_features:
+                            current_col = f'{env_feat}_current'
+                            if current_col in segment_features.columns:
+                                avg_value = segment_features[current_col].mean()
+                                
+                                # 根据特征值判断影响
+                                if env_feat == 'temperature':
+                                    if avg_value > 25:
+                                        segment_info['key_factors'].append(f'高温({avg_value:.1f}°C)可能增加空调负荷')
+                                    elif avg_value < 10:
+                                        segment_info['key_factors'].append(f'低温({avg_value:.1f}°C)可能增加供暖负荷')
+                                    else:
+                                        segment_info['key_factors'].append(f'温度适中({avg_value:.1f}°C)')
+                                
+                                elif env_feat == 'humidity':
+                                    if avg_value > 70:
+                                        segment_info['key_factors'].append(f'高湿度({avg_value:.1f}%)可能增加除湿需求')
+                                    elif avg_value < 30:
+                                        segment_info['key_factors'].append(f'低湿度({avg_value:.1f}%)')
+                                
+                                elif env_feat == 'cloudCover':
+                                    if avg_value > 0.7:
+                                        segment_info['key_factors'].append(f'多云({avg_value:.2f})减少自然采光')
+                                    elif avg_value < 0.3:
+                                        segment_info['key_factors'].append(f'晴朗({avg_value:.2f})增加自然采光')
+                        
+                        # 分析时间特征的影响
+                        if 'hour' in segment_features.columns:
+                            avg_hour = segment_features['hour'].mean()
+                            if 6 <= avg_hour < 9:
+                                segment_info['key_factors'].append('早高峰时段 - 起床、早餐活动')
+                            elif 9 <= avg_hour < 12:
+                                segment_info['key_factors'].append('上午时段 - 多数家庭成员外出')
+                            elif 12 <= avg_hour < 14:
+                                segment_info['key_factors'].append('午间时段 - 午餐、休息')
+                            elif 14 <= avg_hour < 18:
+                                segment_info['key_factors'].append('下午时段 - 持续低负荷')
+                            elif 18 <= avg_hour < 22:
+                                segment_info['key_factors'].append('晚高峰时段 - 回家、晚餐、娱乐')
+                            elif 22 <= avg_hour or avg_hour < 6:
+                                segment_info['key_factors'].append('夜间时段 - 睡眠、待机负荷')
+                        
+                        # 分析负荷变化率
+                        if 'load_smooth' in segment_features.columns:
+                            load_std = segment_features['load_smooth'].std()
+                            if load_std > 0.2:
+                                segment_info['key_factors'].append(f'负荷波动较大(标准差={load_std:.3f})')
+                            else:
+                                segment_info['key_factors'].append(f'负荷相对稳定(标准差={load_std:.3f})')
+                
+                except Exception as e:
+                    print(f"⚠️ 分析阶段 {i+1} 特征时出错: {e}")
+            
+            # 如果没有找到具体因素，添加通用说明
+            if not segment_info['key_factors']:
+                segment_info['key_factors'].append('负荷水平主要由用户行为模式决定')
+            
+            explanations['segment_analysis'].append(segment_info)
+        
+        # 2. 分析阶段间的趋势变化
+        if len(segments) > 1:
+            trend_changes = []
+            for i in range(len(segments) - 1):
+                curr_seg = segments[i]
+                next_seg = segments[i + 1]
+                
+                load_change = next_seg[3] - curr_seg[3]
+                load_change_pct = (load_change / curr_seg[3] * 100) if curr_seg[3] != 0 else 0
+                
+                trend_info = {
+                    'from_segment': i + 1,
+                    'to_segment': i + 2,
+                    'load_change': float(load_change),
+                    'load_change_percent': float(load_change_pct),
+                    'trend': '',
+                    'explanation': []
+                }
+                
+                # 判断变化趋势
+                if abs(load_change_pct) < 5:
+                    trend_info['trend'] = '稳定'
+                    trend_info['explanation'].append('负荷水平基本保持不变')
+                elif load_change_pct > 0:
+                    if load_change_pct > 30:
+                        trend_info['trend'] = '显著上升'
+                        trend_info['explanation'].append(f'负荷大幅增加{load_change_pct:.1f}%')
+                    else:
+                        trend_info['trend'] = '上升'
+                        trend_info['explanation'].append(f'负荷增加{load_change_pct:.1f}%')
+                else:
+                    if load_change_pct < -30:
+                        trend_info['trend'] = '显著下降'
+                        trend_info['explanation'].append(f'负荷大幅下降{abs(load_change_pct):.1f}%')
+                    else:
+                        trend_info['trend'] = '下降'
+                        trend_info['explanation'].append(f'负荷下降{abs(load_change_pct):.1f}%')
+                
+                # 尝试解释变化原因（基于时间和环境）
+                curr_start_hour = curr_seg[0] * 15 / 60
+                next_start_hour = next_seg[0] * 15 / 60
+                
+                # 时间相关的变化解释
+                if curr_start_hour < 6 and next_start_hour >= 6:
+                    trend_info['explanation'].append('进入早晨时段，家庭活动增加')
+                elif curr_start_hour < 18 and next_start_hour >= 18:
+                    trend_info['explanation'].append('进入傍晚时段，家庭成员返回')
+                elif curr_start_hour < 22 and next_start_hour >= 22:
+                    trend_info['explanation'].append('进入深夜时段，活动减少')
+                elif curr_start_hour >= 9 and next_start_hour < 18:
+                    trend_info['explanation'].append('日间时段，多数家庭成员外出工作')
+                
+                trend_changes.append(trend_info)
+            
+            explanations['trend_analysis'] = {
+                'total_segments': len(segments),
+                'transitions': trend_changes,
+                'max_load': float(max([seg[3] for seg in segments])),
+                'min_load': float(min([seg[3] for seg in segments])),
+                'load_range': float(max([seg[3] for seg in segments]) - min([seg[3] for seg in segments]))
+            }
+        
+        # 3. 特征重要性分析（基于特征变化与负荷变化的相关性）
+        if available_env_features:
+            feature_correlations = {}
+            
+            for env_feat in available_env_features:
+                current_col = f'{env_feat}_current'
+                if current_col in feat_df.columns:
+                    try:
+                        # 简单的相关性分析
+                        if 'load_smooth' in feat_df.columns:
+                            valid_indices = ~(feat_df[current_col].isna() | feat_df['load_smooth'].isna())
+                            if valid_indices.sum() > 10:
+                                correlation = feat_df.loc[valid_indices, current_col].corr(
+                                    feat_df.loc[valid_indices, 'load_smooth']
+                                )
+                                feature_correlations[env_feat] = float(correlation)
+                    except Exception as e:
+                        print(f"⚠️ 计算 {env_feat} 相关性时出错: {e}")
+            
+            # 排序特征重要性
+            sorted_features = sorted(feature_correlations.items(), key=lambda x: abs(x[1]), reverse=True)
+            
+            explanations['feature_importance'] = {
+                'correlations': dict(sorted_features),
+                'top_features': [f[0] for f in sorted_features[:3]],
+                'interpretation': []
+            }
+            
+            for feat, corr in sorted_features[:3]:
+                if abs(corr) > 0.3:
+                    direction = '正相关' if corr > 0 else '负相关'
+                    explanations['feature_importance']['interpretation'].append(
+                        f'{feat}与负荷呈{direction}(相关系数={corr:.3f})'
+                    )
+        
+        # 4. 环境因素综合影响评估
+        if available_env_features and pred_times:
+            env_impact = {}
+            
+            for env_feat in available_env_features:
+                current_col = f'{env_feat}_current'
+                if current_col in feat_df.columns:
+                    try:
+                        # 计算全天该特征的统计信息
+                        values = []
+                        for t in pred_times:
+                            idx = feat_df.index.get_indexer([t], method='nearest')[0]
+                            if 0 <= idx < len(feat_df):
+                                val = feat_df.iloc[idx][current_col]
+                                if not np.isnan(val):
+                                    values.append(val)
+                        
+                        if values:
+                            env_impact[env_feat] = {
+                                'mean': float(np.mean(values)),
+                                'std': float(np.std(values)),
+                                'min': float(np.min(values)),
+                                'max': float(np.max(values)),
+                                'range': float(np.max(values) - np.min(values))
+                            }
+                    except Exception as e:
+                        print(f"⚠️ 分析 {env_feat} 影响时出错: {e}")
+            
+            explanations['environmental_impact'] = env_impact
+        
+        return explanations
+        
+    except Exception as e:
+        print(f"❌ 负荷变化解释分析失败: {e}")
+        import traceback
+        traceback.print_exc()
+        return {
+            'segment_analysis': [],
+            'trend_analysis': {},
+            'feature_importance': {},
+            'environmental_impact': {},
+            'error': str(e)
+        }
+
+def generate_explanation_report(explanations, output_path):
+    """
+    生成负荷变化可解释性报告（文本格式）
+    
+    参数:
+    - explanations: 解释分析结果字典
+    - output_path: 报告保存路径
+    """
+    try:
+        with open(output_path, 'w', encoding='utf-8') as f:
+            f.write("="*80 + "\n")
+            f.write("负荷变化可解释性分析报告\n")
+            f.write("="*80 + "\n\n")
+            
+            # 1. 阶段分析
+            f.write("【阶段详细分析】\n")
+            f.write("-"*80 + "\n")
+            for seg in explanations.get('segment_analysis', []):
+                f.write(f"\n阶段 {seg['segment_id']}:\n")
+                f.write(f"  时间范围: {seg['start_time']:.2f}h - {seg['end_time']:.2f}h (持续 {seg['duration_hours']:.2f}小时)\n")
+                f.write(f"  负荷水平: {seg['load_level']} (平均值: {seg['mean_load']:.4f})\n")
+                f.write(f"  状态编号: {seg['state']}\n")
+                f.write(f"  关键影响因素:\n")
+                for factor in seg['key_factors']:
+                    f.write(f"    • {factor}\n")
+            
+            # 2. 趋势分析
+            if explanations.get('trend_analysis'):
+                f.write("\n\n【阶段间趋势变化分析】\n")
+                f.write("-"*80 + "\n")
+                trend = explanations['trend_analysis']
+                f.write(f"总阶段数: {trend.get('total_segments', 0)}\n")
+                f.write(f"负荷范围: {trend.get('min_load', 0):.4f} - {trend.get('max_load', 0):.4f}\n")
+                f.write(f"负荷波动幅度: {trend.get('load_range', 0):.4f}\n\n")
+                
+                for trans in trend.get('transitions', []):
+                    f.write(f"\n阶段 {trans['from_segment']} → 阶段 {trans['to_segment']}:\n")
+                    f.write(f"  变化趋势: {trans['trend']}\n")
+                    f.write(f"  负荷变化: {trans['load_change']:+.4f} ({trans['load_change_percent']:+.1f}%)\n")
+                    f.write(f"  变化原因:\n")
+                    for exp in trans['explanation']:
+                        f.write(f"    • {exp}\n")
+            
+            # 3. 特征重要性
+            if explanations.get('feature_importance'):
+                f.write("\n\n【特征重要性分析】\n")
+                f.write("-"*80 + "\n")
+                feat_imp = explanations['feature_importance']
+                
+                if feat_imp.get('top_features'):
+                    f.write("最重要的环境特征:\n")
+                    for feat in feat_imp['top_features']:
+                        corr = feat_imp['correlations'].get(feat, 0)
+                        f.write(f"  • {feat} (相关系数: {corr:+.3f})\n")
+                
+                if feat_imp.get('interpretation'):
+                    f.write("\n特征影响解释:\n")
+                    for interp in feat_imp['interpretation']:
+                        f.write(f"  • {interp}\n")
+            
+            # 4. 环境因素影响
+            if explanations.get('environmental_impact'):
+                f.write("\n\n【环境因素综合影响】\n")
+                f.write("-"*80 + "\n")
+                for feat, stats in explanations['environmental_impact'].items():
+                    f.write(f"\n{feat}:\n")
+                    f.write(f"  平均值: {stats['mean']:.2f}\n")
+                    f.write(f"  标准差: {stats['std']:.2f}\n")
+                    f.write(f"  范围: {stats['min']:.2f} - {stats['max']:.2f}\n")
+                    f.write(f"  波动幅度: {stats['range']:.2f}\n")
+            
+            f.write("\n" + "="*80 + "\n")
+            f.write("报告生成完成\n")
+            f.write("="*80 + "\n")
+        
+        print(f"✅ 可解释性报告已保存到: {output_path}")
+        
+    except Exception as e:
+        print(f"❌ 生成报告失败: {e}")
+
+def visualize_explanations(explanations, output_path):
+    """
+    可视化负荷变化解释结果
+    
+    参数:
+    - explanations: 解释分析结果字典
+    - output_path: 图片保存路径
+    """
+    try:
+        import matplotlib.pyplot as plt
+        
+        # 创建多子图布局
+        fig = plt.figure(figsize=(16, 12))
+        gs = fig.add_gridspec(3, 2, hspace=0.3, wspace=0.3)
+        
+        # 1. 阶段负荷水平柱状图
+        ax1 = fig.add_subplot(gs[0, :])
+        seg_analysis = explanations.get('segment_analysis', [])
+        if seg_analysis:
+            seg_ids = [seg['segment_id'] for seg in seg_analysis]
+            seg_loads = [seg['mean_load'] for seg in seg_analysis]
+            seg_levels = [seg['load_level'] for seg in seg_analysis]
+            
+            colors = []
+            for level in seg_levels:
+                if level == '低负荷':
+                    colors.append('green')
+                elif level == '中低负荷':
+                    colors.append('lightgreen')
+                elif level == '中高负荷':
+                    colors.append('orange')
+                else:
+                    colors.append('red')
+            
+            bars = ax1.bar(seg_ids, seg_loads, color=colors, alpha=0.7, edgecolor='black')
+            ax1.set_xlabel('阶段编号' if HAS_CJK_FONT else 'Stage ID', fontsize=12)
+            ax1.set_ylabel('平均负荷' if HAS_CJK_FONT else 'Average Load', fontsize=12)
+            ax1.set_title('各阶段负荷水平对比' if HAS_CJK_FONT else 'Load Level Comparison', fontsize=14, fontweight='bold')
+            ax1.grid(True, alpha=0.3, axis='y')
+            
+            # 添加数值标签
+            for bar, load, level in zip(bars, seg_loads, seg_levels):
+                height = bar.get_height()
+                ax1.text(bar.get_x() + bar.get_width()/2., height,
+                        f'{load:.3f}\n{level}',
+                        ha='center', va='bottom', fontsize=9)
+        
+        # 2. 趋势变化折线图
+        ax2 = fig.add_subplot(gs[1, 0])
+        trend_analysis = explanations.get('trend_analysis', {})
+        if trend_analysis and trend_analysis.get('transitions'):
+            transitions = trend_analysis['transitions']
+            from_segs = [t['from_segment'] for t in transitions]
+            change_pcts = [t['load_change_percent'] for t in transitions]
+            
+            ax2.plot(from_segs, change_pcts, marker='o', linewidth=2, markersize=8, color='blue')
+            ax2.axhline(y=0, color='red', linestyle='--', alpha=0.5)
+            ax2.fill_between(from_segs, 0, change_pcts, alpha=0.3, 
+                            color=['green' if c < 0 else 'red' for c in change_pcts])
+            ax2.set_xlabel('起始阶段' if HAS_CJK_FONT else 'From Stage', fontsize=12)
+            ax2.set_ylabel('负荷变化率 (%)' if HAS_CJK_FONT else 'Load Change (%)', fontsize=12)
+            ax2.set_title('阶段间负荷变化率' if HAS_CJK_FONT else 'Load Change Rate', fontsize=12, fontweight='bold')
+            ax2.grid(True, alpha=0.3)
+        
+        # 3. 特征重要性横向柱状图
+        ax3 = fig.add_subplot(gs[1, 1])
+        feat_imp = explanations.get('feature_importance', {})
+        if feat_imp and feat_imp.get('correlations'):
+            correlations = feat_imp['correlations']
+            features = list(correlations.keys())[:5]  # 取前5个
+            corr_values = [correlations[f] for f in features]
+            
+            colors = ['green' if c > 0 else 'red' for c in corr_values]
+            bars = ax3.barh(features, corr_values, color=colors, alpha=0.7, edgecolor='black')
+            ax3.axvline(x=0, color='black', linestyle='-', linewidth=0.5)
+            ax3.set_xlabel('相关系数' if HAS_CJK_FONT else 'Correlation', fontsize=12)
+            ax3.set_ylabel('环境特征' if HAS_CJK_FONT else 'Features', fontsize=12)
+            ax3.set_title('特征与负荷相关性' if HAS_CJK_FONT else 'Feature-Load Correlation', fontsize=12, fontweight='bold')
+            ax3.grid(True, alpha=0.3, axis='x')
+            
+            # 添加数值标签
+            for bar, val in zip(bars, corr_values):
+                width = bar.get_width()
+                ax3.text(width, bar.get_y() + bar.get_height()/2.,
+                        f'{val:+.3f}',
+                        ha='left' if width > 0 else 'right', 
+                        va='center', fontsize=9)
+        
+        # 4. 环境因素影响雷达图
+        ax4 = fig.add_subplot(gs[2, :], projection='polar')
+        env_impact = explanations.get('environmental_impact', {})
+        if env_impact:
+            features = list(env_impact.keys())
+            # 归一化range值用于雷达图
+            ranges = [env_impact[f]['range'] for f in features]
+            max_range = max(ranges) if ranges else 1
+            normalized_ranges = [r / max_range for r in ranges]
+            
+            angles = np.linspace(0, 2 * np.pi, len(features), endpoint=False).tolist()
+            normalized_ranges += normalized_ranges[:1]  # 闭合图形
+            angles += angles[:1]
+            
+            ax4.plot(angles, normalized_ranges, 'o-', linewidth=2, color='blue')
+            ax4.fill(angles, normalized_ranges, alpha=0.25, color='blue')
+            ax4.set_xticks(angles[:-1])
+            ax4.set_xticklabels(features, fontsize=10)
+            ax4.set_ylim(0, 1)
+            ax4.set_title('环境因素波动幅度' if HAS_CJK_FONT else 'Environmental Factors Variation', 
+                         fontsize=12, fontweight='bold', pad=20)
+            ax4.grid(True)
+        
+        plt.tight_layout()
+        fig.savefig(output_path, dpi=200, bbox_inches='tight')
+        plt.close(fig)
+        
+        print(f"✅ 可解释性可视化图已保存到: {output_path}")
+        
+    except Exception as e:
+        print(f"❌ 生成可视化失败: {e}")
+        import traceback
+        traceback.print_exc()
+
 def simple_load_segmentation(load_values, n_segments=4, min_segment_length=8):
     """
     简单的负荷分段方法（作为HMM的备选方案）
@@ -1490,6 +1965,25 @@ def plot_single_day_prediction(ts, feat_df, pred_date, pred_values, pred_times, 
         print(f"   绝对误差: {error:.4f}")
         print(f"   MAPE: {mape:.2f}%")
         
+        # 生成负荷变化可解释性分析
+        print("\n🔍 生成负荷变化可解释性分析...")
+        explanations = explain_load_changes(segments, feat_df, pred_times, pred_resampled.values)
+        
+        # 保存可解释性报告
+        report_path = os.path.join(out_dir, f'explanation_report_{pred_date_obj.strftime("%Y%m%d")}.txt')
+        generate_explanation_report(explanations, report_path)
+        
+        # 保存可解释性可视化
+        viz_path = os.path.join(out_dir, f'explanation_viz_{pred_date_obj.strftime("%Y%m%d")}.png')
+        visualize_explanations(explanations, viz_path)
+        
+        # 打印简要解释
+        print("\n📊 负荷变化解释摘要:")
+        for seg in explanations.get('segment_analysis', []):
+            print(f"   阶段{seg['segment_id']}: {seg['load_level']} ({seg['start_time']:.1f}h-{seg['end_time']:.1f}h)")
+            if seg['key_factors']:
+                print(f"      关键因素: {seg['key_factors'][0]}")
+        
         return {
             'date': pred_date_obj,
             'actual_mean': actual_mean,
@@ -1501,7 +1995,10 @@ def plot_single_day_prediction(ts, feat_df, pred_date, pred_values, pred_times, 
             'pred_times': pred_times,
             'segments': segments,
             'states': states.tolist(),
-            'state_means': state_means.tolist()
+            'state_means': state_means.tolist(),
+            'explanations': explanations,
+            'explanation_report': report_path,
+            'explanation_viz': viz_path
         }
         
     except Exception as e:
@@ -1611,12 +2108,31 @@ def predict_mode():
                     detail_path = os.path.join(prediction_dir, f"prediction_detail_{target_datetime.date().strftime('%Y%m%d')}.csv")
                     pd.DataFrame(detailed_results).to_csv(detail_path, index=False, encoding='utf-8-sig')
 
-                    # 保存汇总结果
+                    # 保存汇总结果（排除不能序列化的对象）
+                    result_for_save = {
+                        'date': result['date'],
+                        'actual_mean': result['actual_mean'],
+                        'predicted_mean': result['predicted_mean'],
+                        'error': result['error'],
+                        'mape': result['mape'],
+                        'image_path': result['image_path'],
+                        'num_segments': len(result.get('segments', [])),
+                        'explanation_report': result.get('explanation_report', ''),
+                        'explanation_viz': result.get('explanation_viz', '')
+                    }
                     result_path = os.path.join(prediction_dir, f"prediction_summary_{target_datetime.date().strftime('%Y%m%d')}.csv")
-                    pd.DataFrame([result]).to_csv(result_path, index=False, encoding='utf-8-sig')
+                    pd.DataFrame([result_for_save]).to_csv(result_path, index=False, encoding='utf-8-sig')
 
                     print(f"✅ 详细预测结果已保存到: {detail_path}")
                     print(f"✅ 汇总预测结果已保存到: {result_path}")
+                    
+                    # 保存可解释性分析结果（JSON格式）
+                    if 'explanations' in result:
+                        import json
+                        explanation_json_path = os.path.join(prediction_dir, f"explanation_{target_datetime.date().strftime('%Y%m%d')}.json")
+                        with open(explanation_json_path, 'w', encoding='utf-8') as f:
+                            json.dump(result['explanations'], f, ensure_ascii=False, indent=2)
+                        print(f"✅ 可解释性分析(JSON)已保存到: {explanation_json_path}")
 
                 print(f"\n🎉 预测完成！")
 
