@@ -1133,88 +1133,132 @@ def compare_with_historical_stages(current_segments, historical_segments,
                 except Exception as e:
                     print(f"⚠️ 提取环境特征差异时出错: {e}")
                 
+                # 计算时间偏移（阶段的左移或右移）
+                hist_start_hour = hist_start * 15 / 60
+                hist_end_hour = (hist_end + 1) * 15 / 60
+                hist_mid_hour = (hist_start_hour + hist_end_hour) / 2
+                
+                # 使用阶段的中心点时间来判断整体偏移
+                time_shift = curr_mid_hour - hist_mid_hour
+                
                 aligned_stage = {
                     'current_stage': curr_idx + 1,
                     'historical_stage': best_match + 1,
                     'current_time_range': f"{curr_start_hour:.1f}h-{curr_end_hour:.1f}h",
-                    'historical_time_range': f"{hist_start * 15 / 60:.1f}h-{(hist_end + 1) * 15 / 60:.1f}h",
+                    'historical_time_range': f"{hist_start_hour:.1f}h-{hist_end_hour:.1f}h",
                     'current_load': float(curr_mean),
                     'historical_load': float(hist_mean),
                     'load_difference': float(load_diff),
                     'load_difference_percent': float(load_diff_pct),
                     'time_overlap': float(best_overlap),
+                    'time_shift': float(time_shift),  # 正值表示右移（推迟），负值表示左移（提前）
                     'environment_diff': env_diff
                 }
                 
                 comparison['aligned_stages'].append(aligned_stage)
         
-        # 3. 识别差异较大的负荷阶段
+        # 3. 识别差异较大的负荷阶段（负荷差异 > 20% 或 时间偏移 >= 1小时）
         for aligned in comparison['aligned_stages']:
-            if abs(aligned['load_difference_percent']) > 20:  # 差异超过20%
+            has_load_diff = abs(aligned['load_difference_percent']) > 20
+            has_time_shift = abs(aligned['time_shift']) >= 1.0  # 偏移超过1小时
+            
+            if has_load_diff or has_time_shift:
                 diff_info = {
                     'current_stage': aligned['current_stage'],
                     'historical_stage': aligned['historical_stage'],
                     'time_range': aligned['current_time_range'],
+                    'historical_time_range': aligned['historical_time_range'],
                     'load_change': aligned['load_difference'],
                     'load_change_percent': aligned['load_difference_percent'],
+                    'time_shift': aligned['time_shift'],
                     'change_type': '增加' if aligned['load_difference'] > 0 else '减少',
+                    'shift_direction': '右移(推迟)' if aligned['time_shift'] > 0 else ('左移(提前)' if aligned['time_shift'] < 0 else '无偏移'),
                     'explanations': []
                 }
                 
                 # 4. 结合人的行为对差异进行解释
                 curr_start_hour = float(aligned['current_time_range'].split('-')[0].replace('h', ''))
+                hist_start_hour = float(aligned['historical_time_range'].split('-')[0].replace('h', ''))
                 
-                # 基于时间段和负荷变化的行为解释
-                if aligned['load_difference'] > 0:  # 负荷增加
-                    if 6 <= curr_start_hour < 9:
+                # 首先解释时间偏移（阶段的左移或右移）
+                if abs(aligned['time_shift']) >= 1.0:
+                    shift_hours = abs(aligned['time_shift'])
+                    shift_dir = '推迟' if aligned['time_shift'] > 0 else '提前'
+                    
+                    # 判断阶段类型以提供更具体的解释
+                    if 6 <= hist_start_hour < 9 or 6 <= curr_start_hour < 9:
                         diff_info['explanations'].append(
-                            '早高峰时段负荷增加，可能是：起床时间提前、早餐准备更复杂、或增加了热水器/咖啡机使用'
+                            f'早高峰阶段时间{shift_dir}约{shift_hours:.1f}小时，可能是：因为周末/假日导致起床时间{shift_dir}、或作息时间调整'
                         )
-                    elif 9 <= curr_start_hour < 12:
+                    elif 12 <= hist_start_hour < 14 or 12 <= curr_start_hour < 14:
                         diff_info['explanations'].append(
-                            '上午时段负荷增加，可能是：在家办公、使用更多电器、或家庭成员未外出'
+                            f'午间阶段时间{shift_dir}约{shift_hours:.1f}小时，可能是：用餐时间{shift_dir}、或午休习惯改变'
                         )
-                    elif 12 <= curr_start_hour < 14:
+                    elif 18 <= hist_start_hour < 22 or 18 <= curr_start_hour < 22:
                         diff_info['explanations'].append(
-                            '午间时段负荷增加，可能是：在家用餐、使用厨房电器增加、或午休期间使用空调/暖气'
+                            f'晚高峰阶段时间{shift_dir}约{shift_hours:.1f}小时，可能是：下班/回家时间{shift_dir}、或晚餐时间调整'
                         )
-                    elif 14 <= curr_start_hour < 18:
+                    elif 22 <= hist_start_hour or 22 <= curr_start_hour or curr_start_hour < 6 or hist_start_hour < 6:
                         diff_info['explanations'].append(
-                            '下午时段负荷增加，可能是：在家时间增加、使用娱乐设备、或提前准备晚餐'
+                            f'夜间阶段时间{shift_dir}约{shift_hours:.1f}小时，可能是：就寝时间{shift_dir}、或夜间活动习惯改变'
                         )
-                    elif 18 <= curr_start_hour < 22:
+                    else:
                         diff_info['explanations'].append(
-                            '晚高峰时段负荷增加，可能是：回家时间提前、晚餐准备更复杂、家庭娱乐活动增加、或使用更多照明和空调'
+                            f'该阶段时间整体{shift_dir}约{shift_hours:.1f}小时，可能是：日常作息时间调整、工作/休息模式改变'
                         )
-                    else:  # 夜间
-                        diff_info['explanations'].append(
-                            '夜间时段负荷增加，可能是：就寝时间推迟、夜间使用电器增加、或保持更多设备待机'
-                        )
-                else:  # 负荷减少
-                    if 6 <= curr_start_hour < 9:
-                        diff_info['explanations'].append(
-                            '早高峰时段负荷减少，可能是：外出时间提前、简化早餐准备、或减少电器使用'
-                        )
-                    elif 9 <= curr_start_hour < 12:
-                        diff_info['explanations'].append(
-                            '上午时段负荷减少，可能是：家庭成员外出增加、减少在家办公、或优化了电器使用'
-                        )
-                    elif 12 <= curr_start_hour < 14:
-                        diff_info['explanations'].append(
-                            '午间时段负荷减少，可能是：外出用餐、减少厨房电器使用、或优化了空调使用'
-                        )
-                    elif 14 <= curr_start_hour < 18:
-                        diff_info['explanations'].append(
-                            '下午时段负荷减少，可能是：外出时间延长、减少电器待机、或改善了节能习惯'
-                        )
-                    elif 18 <= curr_start_hour < 22:
-                        diff_info['explanations'].append(
-                            '晚高峰时段负荷减少，可能是：回家时间推迟、简化晚餐准备、减少娱乐设备使用、或改善照明和空调使用习惯'
-                        )
-                    else:  # 夜间
-                        diff_info['explanations'].append(
-                            '夜间时段负荷减少，可能是：就寝时间提前、关闭更多电器、或减少设备待机功耗'
-                        )
+                
+                # 基于时间段和负荷变化的行为解释（仅在负荷差异显著时添加）
+                if abs(aligned['load_difference_percent']) > 20:
+                    if aligned['load_difference'] > 0:  # 负荷增加
+                        if 6 <= curr_start_hour < 9:
+                            diff_info['explanations'].append(
+                                '早高峰时段负荷增加，可能是：起床时间提前、早餐准备更复杂、或增加了热水器/咖啡机使用'
+                            )
+                        elif 9 <= curr_start_hour < 12:
+                            diff_info['explanations'].append(
+                                '上午时段负荷增加，可能是：在家办公、使用更多电器、或家庭成员未外出'
+                            )
+                        elif 12 <= curr_start_hour < 14:
+                            diff_info['explanations'].append(
+                                '午间时段负荷增加，可能是：在家用餐、使用厨房电器增加、或午休期间使用空调/暖气'
+                            )
+                        elif 14 <= curr_start_hour < 18:
+                            diff_info['explanations'].append(
+                                '下午时段负荷增加，可能是：在家时间增加、使用娱乐设备、或提前准备晚餐'
+                            )
+                        elif 18 <= curr_start_hour < 22:
+                            diff_info['explanations'].append(
+                                '晚高峰时段负荷增加，可能是：回家时间提前、晚餐准备更复杂、家庭娱乐活动增加、或使用更多照明和空调'
+                            )
+                        else:  # 夜间
+                            diff_info['explanations'].append(
+                                '夜间时段负荷增加，可能是：就寝时间推迟、夜间使用电器增加、或保持更多设备待机'
+                            )
+                    else:  # 负荷减少
+                        if 6 <= curr_start_hour < 9:
+                            diff_info['explanations'].append(
+                                '早高峰时段负荷减少，可能是：外出时间提前、简化早餐准备、或减少电器使用'
+                            )
+                        elif 9 <= curr_start_hour < 12:
+                            diff_info['explanations'].append(
+                                '上午时段负荷减少，可能是：家庭成员外出增加、减少在家办公、或优化了电器使用'
+                            )
+                        elif 12 <= curr_start_hour < 14:
+                            diff_info['explanations'].append(
+                                '午间时段负荷减少，可能是：外出用餐、减少厨房电器使用、或优化了空调使用'
+                            )
+                        elif 14 <= curr_start_hour < 18:
+                            diff_info['explanations'].append(
+                                '下午时段负荷减少，可能是：外出时间延长、减少电器待机、或改善了节能习惯'
+                            )
+                        elif 18 <= curr_start_hour < 22:
+                            diff_info['explanations'].append(
+                                '晚高峰时段负荷减少，可能是：回家时间推迟、简化晚餐准备、减少娱乐设备使用、或改善照明和空调使用习惯'
+                            )
+                        else:  # 夜间
+                            diff_info['explanations'].append(
+                                '夜间时段负荷减少，可能是：就寝时间提前、关闭更多电器、或减少设备待机功耗'
+                            )
                 
                 # 结合环境特征的解释
                 if 'environment_diff' in aligned and aligned['environment_diff']:
@@ -1268,6 +1312,36 @@ def compare_with_historical_stages(current_segments, historical_segments,
             increase_count = sum(1 for d in comparison['significant_differences'] if d['load_change'] > 0)
             decrease_count = len(comparison['significant_differences']) - increase_count
             
+            # 统计时间偏移模式
+            shift_count = sum(1 for d in comparison['significant_differences'] if abs(d.get('time_shift', 0)) >= 1.0)
+            right_shift_count = sum(1 for d in comparison['significant_differences'] if d.get('time_shift', 0) >= 1.0)
+            left_shift_count = sum(1 for d in comparison['significant_differences'] if d.get('time_shift', 0) <= -1.0)
+            
+            # 添加时间偏移总体分析
+            if shift_count > 0:
+                if right_shift_count > left_shift_count:
+                    comparison['behavior_explanations'].append(
+                        f'时间偏移模式：整体右移(推迟)为主，{shift_count}个阶段有显著时间偏移（{right_shift_count}个右移，{left_shift_count}个左移）'
+                    )
+                    comparison['behavior_explanations'].append(
+                        '偏移原因：可能是周末/假日作息推迟、工作时间调整、或生活习惯改变'
+                    )
+                elif left_shift_count > right_shift_count:
+                    comparison['behavior_explanations'].append(
+                        f'时间偏移模式：整体左移(提前)为主，{shift_count}个阶段有显著时间偏移（{left_shift_count}个左移，{right_shift_count}个右移）'
+                    )
+                    comparison['behavior_explanations'].append(
+                        '偏移原因：可能是工作日作息提前、早起习惯养成、或活动时间整体前移'
+                    )
+                else:
+                    comparison['behavior_explanations'].append(
+                        f'时间偏移模式：左移和右移并存，{shift_count}个阶段有显著时间偏移'
+                    )
+                    comparison['behavior_explanations'].append(
+                        '偏移原因：不同时段的活动时间调整，用电模式发生重组'
+                    )
+            
+            # 添加负荷变化趋势分析
             if increase_count > decrease_count:
                 comparison['behavior_explanations'].append(
                     f'整体趋势：负荷增加为主({increase_count}个阶段增加，{decrease_count}个阶段减少)'
@@ -1405,6 +1479,14 @@ def generate_explanation_report(explanations, output_path):
                     for aligned in comp['aligned_stages']:
                         f.write(f"\n当前阶段{aligned['current_stage']} ↔ 历史阶段{aligned['historical_stage']}:\n")
                         f.write(f"  时间范围: {aligned['current_time_range']} (当前) vs {aligned['historical_time_range']} (历史)\n")
+                        
+                        # 添加时间偏移信息
+                        if 'time_shift' in aligned:
+                            time_shift = aligned['time_shift']
+                            if abs(time_shift) >= 1.0:
+                                shift_dir = '右移(推迟)' if time_shift > 0 else '左移(提前)'
+                                f.write(f"  时间偏移: {abs(time_shift):.1f} 小时 ({shift_dir})\n")
+                        
                         f.write(f"  负荷水平: {aligned['current_load']:.4f} kW (当前) vs {aligned['historical_load']:.4f} kW (历史)\n")
                         f.write(f"  负荷差异: {aligned['load_difference']:+.4f} kW ({aligned['load_difference_percent']:+.1f}%)\n")
                         if aligned.get('environment_diff'):
@@ -1418,9 +1500,14 @@ def generate_explanation_report(explanations, output_path):
                     f.write("\n\n▶ 差异显著的负荷阶段\n")
                     f.write("-"*80 + "\n")
                     for diff in comp['significant_differences']:
-                        f.write(f"\n阶段{diff['current_stage']} (时间: {diff['time_range']}):\n")
+                        f.write(f"\n阶段{diff['current_stage']} (当前时间: {diff['time_range']}, 历史时间: {diff['historical_time_range']}):\n")
                         f.write(f"  负荷变化: {diff['load_change']:+.4f} kW ({diff['load_change_percent']:+.1f}%)\n")
                         f.write(f"  变化类型: {diff['change_type']}\n")
+                        
+                        # 添加时间偏移信息
+                        if 'time_shift' in diff and abs(diff['time_shift']) >= 1.0:
+                            f.write(f"  时间偏移: {diff['time_shift']:+.1f} 小时 ({diff['shift_direction']})\n")
+                        
                         f.write(f"  行为解释:\n")
                         for exp in diff['explanations']:
                             f.write(f"    • {exp}\n")
