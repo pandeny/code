@@ -724,7 +724,9 @@ def explain_load_changes(segments, feat_df, pred_times, load_values):
             'segment_analysis': [],
             'trend_analysis': {},
             'feature_importance': {},
-            'environmental_impact': {}
+            'environmental_impact': {},
+            'historical_comparison': {},
+            'daily_summary': {}
         }
         
         # 检查可用的环境特征
@@ -805,21 +807,21 @@ def explain_load_changes(segments, feat_df, pred_times, load_values):
                                     elif avg_value < 0.3:
                                         segment_info['key_factors'].append(f'晴朗({avg_value:.2f})增加自然采光')
                         
-                        # 分析时间特征的影响
+                        # 分析时间特征的影响（增强人类行为关联描述）
                         if 'hour' in segment_features.columns:
                             avg_hour = segment_features['hour'].mean()
                             if 6 <= avg_hour < 9:
-                                segment_info['key_factors'].append('早高峰时段 - 起床、早餐活动')
+                                segment_info['key_factors'].append('早高峰时段 - 起床、洗漱、早餐准备，照明、热水器、厨房电器等设备启用')
                             elif 9 <= avg_hour < 12:
-                                segment_info['key_factors'].append('上午时段 - 多数家庭成员外出')
+                                segment_info['key_factors'].append('上午时段 - 多数家庭成员外出上班/上学，仅基础待机负荷')
                             elif 12 <= avg_hour < 14:
-                                segment_info['key_factors'].append('午间时段 - 午餐、休息')
+                                segment_info['key_factors'].append('午间时段 - 部分成员返家午餐或使用微波炉加热，照明和烹饪用电')
                             elif 14 <= avg_hour < 18:
-                                segment_info['key_factors'].append('下午时段 - 持续低负荷')
+                                segment_info['key_factors'].append('下午时段 - 持续低负荷，冰箱等基础设备运行')
                             elif 18 <= avg_hour < 22:
-                                segment_info['key_factors'].append('晚高峰时段 - 回家、晚餐、娱乐')
+                                segment_info['key_factors'].append('晚高峰时段 - 家庭成员返回，晚餐烹饪、照明、电视、空调等集中使用')
                             elif 22 <= avg_hour or avg_hour < 6:
-                                segment_info['key_factors'].append('夜间时段 - 睡眠、待机负荷')
+                                segment_info['key_factors'].append('夜间时段 - 准备睡眠，仅冰箱、路由器等待机负荷')
                         
                         # 分析负荷变化率
                         if 'load_smooth' in segment_features.columns:
@@ -965,6 +967,190 @@ def explain_load_changes(segments, feat_df, pred_times, load_values):
             
             explanations['environmental_impact'] = env_impact
         
+        # 5. 历史负荷对比分析（与1/3/7天前对比）
+        if pred_times and feat_df is not None:
+            historical_comparison = {
+                'comparison_1d': {},
+                'comparison_3d': {},
+                'comparison_7d': {},
+                'overall_trend': ''
+            }
+            
+            try:
+                # 获取预测日的平均负荷
+                pred_mean = float(np.mean(load_values))
+                
+                # 获取历史负荷数据
+                hist_loads_1d = []
+                hist_loads_3d = []
+                hist_loads_7d = []
+                
+                for t in pred_times:
+                    idx = feat_df.index.get_indexer([t], method='nearest')[0]
+                    if 0 <= idx < len(feat_df):
+                        # 1天前
+                        if 'lag_1d' in feat_df.columns and not pd.isna(feat_df.iloc[idx]['lag_1d']):
+                            hist_loads_1d.append(feat_df.iloc[idx]['lag_1d'])
+                        # 3天前 - 从7天窗口中估算
+                        if 'lag_7d' in feat_df.columns and 'median_past7_same_time' in feat_df.columns:
+                            if not pd.isna(feat_df.iloc[idx]['median_past7_same_time']):
+                                hist_loads_3d.append(feat_df.iloc[idx]['median_past7_same_time'])
+                        # 7天前
+                        if 'lag_7d' in feat_df.columns and not pd.isna(feat_df.iloc[idx]['lag_7d']):
+                            hist_loads_7d.append(feat_df.iloc[idx]['lag_7d'])
+                
+                # 计算历史日均值
+                if hist_loads_1d:
+                    hist_mean_1d = float(np.mean(hist_loads_1d))
+                    change_1d = pred_mean - hist_mean_1d
+                    change_1d_pct = (change_1d / hist_mean_1d * 100) if hist_mean_1d != 0 else 0
+                    
+                    # 解释负荷变化
+                    if abs(change_1d_pct) < 5:
+                        interp_1d = '负荷基本持平，用电习惯稳定'
+                    elif change_1d_pct > 20:
+                        interp_1d = '负荷显著增加，可能因季节变化、活动增多或新增用电设备'
+                    elif change_1d_pct > 5:
+                        interp_1d = '负荷略有增加，用电活动有所增强'
+                    elif change_1d_pct < -20:
+                        interp_1d = '负荷显著减少，可能因外出、节能或设备停用'
+                    else:
+                        interp_1d = '负荷略有减少，用电活动有所降低'
+                    
+                    historical_comparison['comparison_1d'] = {
+                        'historical_mean': hist_mean_1d,
+                        'predicted_mean': pred_mean,
+                        'change': float(change_1d),
+                        'change_percent': float(change_1d_pct),
+                        'interpretation': interp_1d
+                    }
+                
+                if hist_loads_3d:
+                    hist_mean_3d = float(np.mean(hist_loads_3d))
+                    change_3d = pred_mean - hist_mean_3d
+                    change_3d_pct = (change_3d / hist_mean_3d * 100) if hist_mean_3d != 0 else 0
+                    
+                    # 解释负荷变化
+                    if abs(change_3d_pct) < 5:
+                        interp_3d = '近3日负荷水平稳定，未见明显波动'
+                    elif change_3d_pct > 20:
+                        interp_3d = '相比3天前负荷明显上升，可能受天气变化或周中周末差异影响'
+                    elif change_3d_pct > 5:
+                        interp_3d = '相比3天前负荷有所上升'
+                    elif change_3d_pct < -20:
+                        interp_3d = '相比3天前负荷明显下降，用电模式有较大变化'
+                    else:
+                        interp_3d = '相比3天前负荷有所下降'
+                    
+                    historical_comparison['comparison_3d'] = {
+                        'historical_mean': hist_mean_3d,
+                        'predicted_mean': pred_mean,
+                        'change': float(change_3d),
+                        'change_percent': float(change_3d_pct),
+                        'interpretation': interp_3d
+                    }
+                
+                if hist_loads_7d:
+                    hist_mean_7d = float(np.mean(hist_loads_7d))
+                    change_7d = pred_mean - hist_mean_7d
+                    change_7d_pct = (change_7d / hist_mean_7d * 100) if hist_mean_7d != 0 else 0
+                    
+                    # 解释负荷变化
+                    if abs(change_7d_pct) < 5:
+                        interp_7d = '周同比负荷稳定，符合周期性规律'
+                    elif change_7d_pct > 20:
+                        interp_7d = '相比上周同日负荷显著增加，可能受天气变化、生活节奏调整影响'
+                    elif change_7d_pct > 5:
+                        interp_7d = '相比上周同日负荷略有增加'
+                    elif change_7d_pct < -20:
+                        interp_7d = '相比上周同日负荷显著减少，用电模式有明显变化'
+                    else:
+                        interp_7d = '相比上周同日负荷略有减少'
+                    
+                    historical_comparison['comparison_7d'] = {
+                        'historical_mean': hist_mean_7d,
+                        'predicted_mean': pred_mean,
+                        'change': float(change_7d),
+                        'change_percent': float(change_7d_pct),
+                        'interpretation': interp_7d
+                    }
+                
+                # 综合趋势判断
+                trends = []
+                if historical_comparison['comparison_1d']:
+                    trends.append(historical_comparison['comparison_1d']['change_percent'])
+                if historical_comparison['comparison_7d']:
+                    trends.append(historical_comparison['comparison_7d']['change_percent'])
+                
+                if trends:
+                    avg_trend = np.mean(trends)
+                    if avg_trend > 10:
+                        historical_comparison['overall_trend'] = '预测日负荷相比历史呈上升趋势，可能由于季节变化、生活习惯调整或用电设备增加'
+                    elif avg_trend < -10:
+                        historical_comparison['overall_trend'] = '预测日负荷相比历史呈下降趋势，可能由于节能意识提升、外出活动增多或用电设备减少'
+                    else:
+                        historical_comparison['overall_trend'] = '预测日负荷与历史水平基本持平，用电模式保持稳定'
+                
+                explanations['historical_comparison'] = historical_comparison
+            except Exception as e:
+                print(f"⚠️ 历史负荷对比分析时出错: {e}")
+        
+        # 6. 预测日用电特征概括
+        daily_summary = {
+            'total_load': float(np.sum(load_values)),
+            'mean_load': float(np.mean(load_values)),
+            'max_load': float(np.max(load_values)),
+            'min_load': float(np.min(load_values)),
+            'load_range': float(np.max(load_values) - np.min(load_values)),
+            'std_load': float(np.std(load_values)),
+            'num_segments': len(segments),
+            'key_characteristics': [],
+            'behavior_patterns': []
+        }
+        
+        # 确定主要负荷特征
+        load_variation = daily_summary['std_load'] / daily_summary['mean_load'] if daily_summary['mean_load'] > 0 else 0
+        if load_variation > 0.5:
+            daily_summary['key_characteristics'].append('负荷波动显著，说明用电活动集中度高')
+        elif load_variation < 0.2:
+            daily_summary['key_characteristics'].append('负荷相对平稳，用电活动分布均匀')
+        else:
+            daily_summary['key_characteristics'].append('负荷波动适中，符合典型家庭用电模式')
+        
+        # 峰谷差分析
+        peak_valley_ratio = daily_summary['max_load'] / daily_summary['min_load'] if daily_summary['min_load'] > 0 else 0
+        if peak_valley_ratio > 5:
+            daily_summary['key_characteristics'].append(f'峰谷差较大({peak_valley_ratio:.1f}倍)，高峰时段用电设备集中使用')
+        elif peak_valley_ratio > 3:
+            daily_summary['key_characteristics'].append(f'峰谷差适中({peak_valley_ratio:.1f}倍)，用电活动有明显时段特征')
+        else:
+            daily_summary['key_characteristics'].append(f'峰谷差较小({peak_valley_ratio:.1f}倍)，全天用电较为均衡')
+        
+        # 根据阶段分析提取行为模式
+        for seg in explanations.get('segment_analysis', []):
+            if seg['load_level'] in ['高负荷', '中高负荷']:
+                # 提取时间段
+                start_h = seg['start_time']
+                end_h = seg['end_time']
+                if 6 <= start_h < 9:
+                    daily_summary['behavior_patterns'].append('早晨活跃：起床后的洗漱、早餐准备等活动形成早高峰')
+                elif 18 <= start_h < 22:
+                    daily_summary['behavior_patterns'].append('傍晚活跃：家庭成员返回后的晚餐、娱乐等活动形成晚高峰')
+                elif 12 <= start_h < 14:
+                    daily_summary['behavior_patterns'].append('午间活动：午餐时段的短暂用电高峰')
+        
+        # 识别低负荷时段
+        low_load_segments = [seg for seg in explanations.get('segment_analysis', []) if seg['load_level'] in ['低负荷', '中低负荷']]
+        if low_load_segments:
+            low_hours = sum([seg['duration_hours'] for seg in low_load_segments])
+            if low_hours > 12:
+                daily_summary['behavior_patterns'].append(f'长时段低负荷({low_hours:.1f}小时)：家庭成员外出或睡眠时间较长')
+        
+        if not daily_summary['behavior_patterns']:
+            daily_summary['behavior_patterns'].append('用电活动分布均匀，未见明显的集中高峰时段')
+        
+        explanations['daily_summary'] = daily_summary
+        
         return explanations
         
     except Exception as e:
@@ -976,6 +1162,8 @@ def explain_load_changes(segments, feat_df, pred_times, load_values):
             'trend_analysis': {},
             'feature_importance': {},
             'environmental_impact': {},
+            'historical_comparison': {},
+            'daily_summary': {},
             'error': str(e)
         }
 
@@ -1049,6 +1237,60 @@ def generate_explanation_report(explanations, output_path):
                     f.write(f"  标准差: {stats['std']:.2f}\n")
                     f.write(f"  范围: {stats['min']:.2f} - {stats['max']:.2f}\n")
                     f.write(f"  波动幅度: {stats['range']:.2f}\n")
+            
+            # 5. 预测日用电特征概括（新增）
+            if explanations.get('daily_summary'):
+                f.write("\n\n【预测日用电特征概括】\n")
+                f.write("-"*80 + "\n")
+                summary = explanations['daily_summary']
+                f.write(f"日总负荷: {summary['total_load']:.2f}\n")
+                f.write(f"日均负荷: {summary['mean_load']:.4f}\n")
+                f.write(f"峰值负荷: {summary['max_load']:.4f}\n")
+                f.write(f"谷值负荷: {summary['min_load']:.4f}\n")
+                f.write(f"负荷标准差: {summary['std_load']:.4f}\n")
+                f.write(f"负荷阶段数: {summary['num_segments']}\n\n")
+                
+                f.write("显著特征:\n")
+                for char in summary['key_characteristics']:
+                    f.write(f"  • {char}\n")
+                
+                f.write("\n人类行为关联:\n")
+                for pattern in summary['behavior_patterns']:
+                    f.write(f"  • {pattern}\n")
+            
+            # 6. 历史负荷对比分析（新增）
+            if explanations.get('historical_comparison'):
+                f.write("\n\n【历史负荷对比分析】\n")
+                f.write("-"*80 + "\n")
+                hist_comp = explanations['historical_comparison']
+                
+                if hist_comp.get('comparison_1d'):
+                    comp_1d = hist_comp['comparison_1d']
+                    f.write(f"\n与1天前对比:\n")
+                    f.write(f"  历史负荷: {comp_1d['historical_mean']:.4f}\n")
+                    f.write(f"  预测负荷: {comp_1d['predicted_mean']:.4f}\n")
+                    f.write(f"  变化量: {comp_1d['change']:+.4f} ({comp_1d['change_percent']:+.1f}%)\n")
+                    f.write(f"  解释: {comp_1d['interpretation']}\n")
+                
+                if hist_comp.get('comparison_3d'):
+                    comp_3d = hist_comp['comparison_3d']
+                    f.write(f"\n与3天前对比:\n")
+                    f.write(f"  历史负荷: {comp_3d['historical_mean']:.4f}\n")
+                    f.write(f"  预测负荷: {comp_3d['predicted_mean']:.4f}\n")
+                    f.write(f"  变化量: {comp_3d['change']:+.4f} ({comp_3d['change_percent']:+.1f}%)\n")
+                    f.write(f"  解释: {comp_3d['interpretation']}\n")
+                
+                if hist_comp.get('comparison_7d'):
+                    comp_7d = hist_comp['comparison_7d']
+                    f.write(f"\n与7天前(上周同日)对比:\n")
+                    f.write(f"  历史负荷: {comp_7d['historical_mean']:.4f}\n")
+                    f.write(f"  预测负荷: {comp_7d['predicted_mean']:.4f}\n")
+                    f.write(f"  变化量: {comp_7d['change']:+.4f} ({comp_7d['change_percent']:+.1f}%)\n")
+                    f.write(f"  解释: {comp_7d['interpretation']}\n")
+                
+                if hist_comp.get('overall_trend'):
+                    f.write(f"\n综合趋势:\n")
+                    f.write(f"  {hist_comp['overall_trend']}\n")
             
             f.write("\n" + "="*80 + "\n")
             f.write("报告生成完成\n")
