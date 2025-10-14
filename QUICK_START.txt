@@ -1,0 +1,37 @@
+╔════════════════════════════════════════════════════════════════════╗
+║       负荷预测可解释性功能 - 快速开始                             ║
+╚════════════════════════════════════════════════════════════════════╝
+
+✨ 好消息：可解释性功能已完全实现！
+
+📖 使用方法：
+
+方式1：运行预测（推荐）
+  python train_household_forecast.py
+  → 选择"预测模式"
+  → 选择日期
+  → 自动生成可解释性分析！
+
+方式2：查看示例
+  python example_interpretability.py
+
+📁 输出文件：
+  ✓ prediction_with_stages_YYYYMMDD.png  （预测结果图）
+  ✓ explanation_report_YYYYMMDD.txt      （分析报告）
+  ✓ explanation_viz_YYYYMMDD.png         （可视化图表）
+  ✓ explanation_YYYYMMDD.json            （JSON数据）
+
+📚 详细文档：
+  • 重要说明_IMPORTANT_NOTE.md          （必读！）
+  • README_INTERPRETABILITY.md           （使用指南）
+  • example_interpretability.py          （示例代码）
+
+🎯 核心功能：
+  ✓ 智能负荷阶段划分
+  ✓ 负荷水平分类（低/中低/中高/高）
+  ✓ 影响因素分析（温度、湿度、时间等）
+  ✓ 趋势变化解释
+  ✓ 自动报告生成
+  ✓ 可视化图表
+
+═══════════════════════════════════════════════════════════════════
