@@ -979,6 +979,335 @@ def explain_load_changes(segments, feat_df, pred_times, load_values):
             'error': str(e)
         }
 
+def compare_with_historical_stages(current_segments, historical_segments, 
+                                   current_feat_df, historical_feat_df,
+                                   current_times, historical_times,
+                                   current_load, historical_load):
+    """
+    与历史负荷阶段进行对比分析
+    
+    参数:
+    - current_segments: 当前负荷分段信息 [(start_idx, end_idx, state, mean_load), ...]
+    - historical_segments: 历史负荷分段信息 [(start_idx, end_idx, state, mean_load), ...]
+    - current_feat_df: 当前特征数据框
+    - historical_feat_df: 历史特征数据框
+    - current_times: 当前时间点列表
+    - historical_times: 历史时间点列表
+    - current_load: 当前负荷值数组
+    - historical_load: 历史负荷值数组
+    
+    返回:
+    - comparison: 包含对比分析结果的字典
+    """
+    try:
+        comparison = {
+            'stage_count_comparison': {},
+            'aligned_stages': [],
+            'significant_differences': [],
+            'behavior_explanations': []
+        }
+        
+        # 1. 分析阶段数量变化
+        current_count = len(current_segments)
+        historical_count = len(historical_segments)
+        count_change = current_count - historical_count
+        count_change_pct = (count_change / historical_count * 100) if historical_count > 0 else 0
+        
+        comparison['stage_count_comparison'] = {
+            'current_count': current_count,
+            'historical_count': historical_count,
+            'change': count_change,
+            'change_percent': count_change_pct,
+            'trend': '增加' if count_change > 0 else ('减少' if count_change < 0 else '不变'),
+            'reasons': []
+        }
+        
+        # 解释阶段数量变化的原因
+        if count_change > 0:
+            comparison['stage_count_comparison']['reasons'].append(
+                f'负荷阶段数增加{abs(count_change)}个，可能原因：'
+            )
+            comparison['stage_count_comparison']['reasons'].append(
+                '  1. 用电行为更加多样化，出现更多负荷切换'
+            )
+            comparison['stage_count_comparison']['reasons'].append(
+                '  2. 家庭成员活动模式发生变化'
+            )
+            comparison['stage_count_comparison']['reasons'].append(
+                '  3. 新增用电设备或改变使用习惯'
+            )
+        elif count_change < 0:
+            comparison['stage_count_comparison']['reasons'].append(
+                f'负荷阶段数减少{abs(count_change)}个，可能原因：'
+            )
+            comparison['stage_count_comparison']['reasons'].append(
+                '  1. 用电行为更加规律，负荷模式简化'
+            )
+            comparison['stage_count_comparison']['reasons'].append(
+                '  2. 家庭成员减少或外出时间增加'
+            )
+            comparison['stage_count_comparison']['reasons'].append(
+                '  3. 减少了用电设备使用或优化了用电习惯'
+            )
+        else:
+            comparison['stage_count_comparison']['reasons'].append(
+                '负荷阶段数保持不变，用电模式相对稳定'
+            )
+        
+        # 2. 逐阶段对齐分析（基于时间和负荷水平）
+        # 使用简单的时间重叠匹配策略
+        aligned_pairs = []
+        
+        for curr_idx, (curr_start, curr_end, curr_state, curr_mean) in enumerate(current_segments):
+            curr_start_hour = curr_start * 15 / 60
+            curr_end_hour = (curr_end + 1) * 15 / 60
+            curr_mid_hour = (curr_start_hour + curr_end_hour) / 2
+            
+            # 找到历史数据中时间最接近的阶段
+            best_match = None
+            best_overlap = 0
+            best_time_diff = float('inf')
+            
+            for hist_idx, (hist_start, hist_end, hist_state, hist_mean) in enumerate(historical_segments):
+                hist_start_hour = hist_start * 15 / 60
+                hist_end_hour = (hist_end + 1) * 15 / 60
+                hist_mid_hour = (hist_start_hour + hist_end_hour) / 2
+                
+                # 计算时间重叠
+                overlap_start = max(curr_start_hour, hist_start_hour)
+                overlap_end = min(curr_end_hour, hist_end_hour)
+                overlap = max(0, overlap_end - overlap_start)
+                
+                # 计算中心点时间差
+                time_diff = abs(curr_mid_hour - hist_mid_hour)
+                
+                # 选择重叠最大或时间最接近的阶段
+                if overlap > best_overlap or (overlap == best_overlap and time_diff < best_time_diff):
+                    best_overlap = overlap
+                    best_time_diff = time_diff
+                    best_match = hist_idx
+            
+            if best_match is not None:
+                hist_start, hist_end, hist_state, hist_mean = historical_segments[best_match]
+                aligned_pairs.append((curr_idx, best_match))
+                
+                # 计算负荷差异
+                load_diff = curr_mean - hist_mean
+                load_diff_pct = (load_diff / hist_mean * 100) if hist_mean != 0 else 0
+                
+                # 提取环境特征差异
+                env_diff = {}
+                try:
+                    # 获取当前阶段的环境特征
+                    if current_times and len(current_times) > curr_end:
+                        curr_segment_times = current_times[curr_start:curr_end+1]
+                        curr_features = []
+                        for t in curr_segment_times:
+                            idx = current_feat_df.index.get_indexer([t], method='nearest')[0]
+                            if 0 <= idx < len(current_feat_df):
+                                curr_features.append(current_feat_df.iloc[idx])
+                        
+                        if curr_features:
+                            curr_feat_mean = pd.DataFrame(curr_features).mean()
+                            
+                            # 获取历史阶段的环境特征
+                            if historical_times and len(historical_times) > hist_end:
+                                hist_segment_times = historical_times[hist_start:hist_end+1]
+                                hist_features = []
+                                for t in hist_segment_times:
+                                    idx = historical_feat_df.index.get_indexer([t], method='nearest')[0]
+                                    if 0 <= idx < len(historical_feat_df):
+                                        hist_features.append(historical_feat_df.iloc[idx])
+                                
+                                if hist_features:
+                                    hist_feat_mean = pd.DataFrame(hist_features).mean()
+                                    
+                                    # 计算主要环境特征的差异
+                                    for feat in ['temperature_current', 'humidity_current', 'cloudCover_current']:
+                                        if feat in curr_feat_mean.index and feat in hist_feat_mean.index:
+                                            env_diff[feat] = {
+                                                'current': float(curr_feat_mean[feat]),
+                                                'historical': float(hist_feat_mean[feat]),
+                                                'diff': float(curr_feat_mean[feat] - hist_feat_mean[feat])
+                                            }
+                except Exception as e:
+                    print(f"⚠️ 提取环境特征差异时出错: {e}")
+                
+                aligned_stage = {
+                    'current_stage': curr_idx + 1,
+                    'historical_stage': best_match + 1,
+                    'current_time_range': f"{curr_start_hour:.1f}h-{curr_end_hour:.1f}h",
+                    'historical_time_range': f"{hist_start * 15 / 60:.1f}h-{(hist_end + 1) * 15 / 60:.1f}h",
+                    'current_load': float(curr_mean),
+                    'historical_load': float(hist_mean),
+                    'load_difference': float(load_diff),
+                    'load_difference_percent': float(load_diff_pct),
+                    'time_overlap': float(best_overlap),
+                    'environment_diff': env_diff
+                }
+                
+                comparison['aligned_stages'].append(aligned_stage)
+        
+        # 3. 识别差异较大的负荷阶段
+        for aligned in comparison['aligned_stages']:
+            if abs(aligned['load_difference_percent']) > 20:  # 差异超过20%
+                diff_info = {
+                    'current_stage': aligned['current_stage'],
+                    'historical_stage': aligned['historical_stage'],
+                    'time_range': aligned['current_time_range'],
+                    'load_change': aligned['load_difference'],
+                    'load_change_percent': aligned['load_difference_percent'],
+                    'change_type': '增加' if aligned['load_difference'] > 0 else '减少',
+                    'explanations': []
+                }
+                
+                # 4. 结合人的行为对差异进行解释
+                curr_start_hour = float(aligned['current_time_range'].split('-')[0].replace('h', ''))
+                
+                # 基于时间段和负荷变化的行为解释
+                if aligned['load_difference'] > 0:  # 负荷增加
+                    if 6 <= curr_start_hour < 9:
+                        diff_info['explanations'].append(
+                            '早高峰时段负荷增加，可能是：起床时间提前、早餐准备更复杂、或增加了热水器/咖啡机使用'
+                        )
+                    elif 9 <= curr_start_hour < 12:
+                        diff_info['explanations'].append(
+                            '上午时段负荷增加，可能是：在家办公、使用更多电器、或家庭成员未外出'
+                        )
+                    elif 12 <= curr_start_hour < 14:
+                        diff_info['explanations'].append(
+                            '午间时段负荷增加，可能是：在家用餐、使用厨房电器增加、或午休期间使用空调/暖气'
+                        )
+                    elif 14 <= curr_start_hour < 18:
+                        diff_info['explanations'].append(
+                            '下午时段负荷增加，可能是：在家时间增加、使用娱乐设备、或提前准备晚餐'
+                        )
+                    elif 18 <= curr_start_hour < 22:
+                        diff_info['explanations'].append(
+                            '晚高峰时段负荷增加，可能是：回家时间提前、晚餐准备更复杂、家庭娱乐活动增加、或使用更多照明和空调'
+                        )
+                    else:  # 夜间
+                        diff_info['explanations'].append(
+                            '夜间时段负荷增加，可能是：就寝时间推迟、夜间使用电器增加、或保持更多设备待机'
+                        )
+                else:  # 负荷减少
+                    if 6 <= curr_start_hour < 9:
+                        diff_info['explanations'].append(
+                            '早高峰时段负荷减少，可能是：外出时间提前、简化早餐准备、或减少电器使用'
+                        )
+                    elif 9 <= curr_start_hour < 12:
+                        diff_info['explanations'].append(
+                            '上午时段负荷减少，可能是：家庭成员外出增加、减少在家办公、或优化了电器使用'
+                        )
+                    elif 12 <= curr_start_hour < 14:
+                        diff_info['explanations'].append(
+                            '午间时段负荷减少，可能是：外出用餐、减少厨房电器使用、或优化了空调使用'
+                        )
+                    elif 14 <= curr_start_hour < 18:
+                        diff_info['explanations'].append(
+                            '下午时段负荷减少，可能是：外出时间延长、减少电器待机、或改善了节能习惯'
+                        )
+                    elif 18 <= curr_start_hour < 22:
+                        diff_info['explanations'].append(
+                            '晚高峰时段负荷减少，可能是：回家时间推迟、简化晚餐准备、减少娱乐设备使用、或改善照明和空调使用习惯'
+                        )
+                    else:  # 夜间
+                        diff_info['explanations'].append(
+                            '夜间时段负荷减少，可能是：就寝时间提前、关闭更多电器、或减少设备待机功耗'
+                        )
+                
+                # 结合环境特征的解释
+                if 'environment_diff' in aligned and aligned['environment_diff']:
+                    env_diff = aligned['environment_diff']
+                    
+                    if 'temperature_current' in env_diff:
+                        temp_diff = env_diff['temperature_current']['diff']
+                        if abs(temp_diff) > 5:
+                            if temp_diff > 0:
+                                diff_info['explanations'].append(
+                                    f'环境温度升高{abs(temp_diff):.1f}°C，可能增加空调制冷需求'
+                                )
+                            else:
+                                diff_info['explanations'].append(
+                                    f'环境温度降低{abs(temp_diff):.1f}°C，可能增加供暖需求'
+                                )
+                    
+                    if 'humidity_current' in env_diff:
+                        humid_diff = env_diff['humidity_current']['diff']
+                        if abs(humid_diff) > 15:
+                            if humid_diff > 0:
+                                diff_info['explanations'].append(
+                                    f'湿度增加{abs(humid_diff):.1f}%，可能影响除湿设备使用'
+                                )
+                            else:
+                                diff_info['explanations'].append(
+                                    f'湿度降低{abs(humid_diff):.1f}%，可能减少除湿需求'
+                                )
+                    
+                    if 'cloudCover_current' in env_diff:
+                        cloud_diff = env_diff['cloudCover_current']['diff']
+                        if abs(cloud_diff) > 0.3:
+                            if cloud_diff > 0:
+                                diff_info['explanations'].append(
+                                    '云量增加，自然采光减少，可能增加照明负荷'
+                                )
+                            else:
+                                diff_info['explanations'].append(
+                                    '云量减少，自然采光增加，可能减少照明负荷'
+                                )
+                
+                comparison['significant_differences'].append(diff_info)
+        
+        # 5. 生成总体行为解释
+        if comparison['significant_differences']:
+            comparison['behavior_explanations'].append(
+                f"共识别出{len(comparison['significant_differences'])}个差异显著的负荷阶段"
+            )
+            
+            # 统计增加和减少的阶段数
+            increase_count = sum(1 for d in comparison['significant_differences'] if d['load_change'] > 0)
+            decrease_count = len(comparison['significant_differences']) - increase_count
+            
+            if increase_count > decrease_count:
+                comparison['behavior_explanations'].append(
+                    f'整体趋势：负荷增加为主({increase_count}个阶段增加，{decrease_count}个阶段减少)'
+                )
+                comparison['behavior_explanations'].append(
+                    '可能原因：家庭活动增加、在家时间延长、新增用电设备、或季节性用电需求变化'
+                )
+            elif decrease_count > increase_count:
+                comparison['behavior_explanations'].append(
+                    f'整体趋势：负荷减少为主({decrease_count}个阶段减少，{increase_count}个阶段增加)'
+                )
+                comparison['behavior_explanations'].append(
+                    '可能原因：外出时间增加、减少电器使用、节能习惯改善、或季节性用电需求降低'
+                )
+            else:
+                comparison['behavior_explanations'].append(
+                    f'整体趋势：增减平衡({increase_count}个阶段增加，{decrease_count}个阶段减少)'
+                )
+                comparison['behavior_explanations'].append(
+                    '可能原因：用电模式调整，不同时段的用电行为发生了变化'
+                )
+        else:
+            comparison['behavior_explanations'].append(
+                '各阶段负荷差异较小，用电模式保持相对稳定'
+            )
+        
+        return comparison
+        
+    except Exception as e:
+        print(f"❌ 历史负荷对比分析失败: {e}")
+        import traceback
+        traceback.print_exc()
+        return {
+            'stage_count_comparison': {},
+            'aligned_stages': [],
+            'significant_differences': [],
+            'behavior_explanations': [],
+            'error': str(e)
+        }
+
 def generate_explanation_report(explanations, output_path):
     """
     生成负荷变化可解释性报告（文本格式）
@@ -1049,6 +1378,59 @@ def generate_explanation_report(explanations, output_path):
                     f.write(f"  标准差: {stats['std']:.2f}\n")
                     f.write(f"  范围: {stats['min']:.2f} - {stats['max']:.2f}\n")
                     f.write(f"  波动幅度: {stats['range']:.2f}\n")
+            
+            # 5. 历史对比分析（如果有）
+            if explanations.get('historical_comparison'):
+                comp = explanations['historical_comparison']
+                f.write("\n\n【与历史负荷对比分析】\n")
+                f.write("="*80 + "\n")
+                
+                # 5.1 阶段数量对比
+                if comp.get('stage_count_comparison'):
+                    scc = comp['stage_count_comparison']
+                    f.write("\n▶ 阶段数量变化分析\n")
+                    f.write("-"*80 + "\n")
+                    f.write(f"当前阶段数: {scc['current_count']}\n")
+                    f.write(f"历史阶段数: {scc['historical_count']}\n")
+                    f.write(f"变化: {scc['change']:+d} 个阶段 ({scc['change_percent']:+.1f}%)\n")
+                    f.write(f"趋势: {scc['trend']}\n\n")
+                    f.write("原因分析:\n")
+                    for reason in scc.get('reasons', []):
+                        f.write(f"  {reason}\n")
+                
+                # 5.2 逐阶段对齐分析
+                if comp.get('aligned_stages'):
+                    f.write("\n\n▶ 逐阶段对齐分析\n")
+                    f.write("-"*80 + "\n")
+                    for aligned in comp['aligned_stages']:
+                        f.write(f"\n当前阶段{aligned['current_stage']} ↔ 历史阶段{aligned['historical_stage']}:\n")
+                        f.write(f"  时间范围: {aligned['current_time_range']} (当前) vs {aligned['historical_time_range']} (历史)\n")
+                        f.write(f"  负荷水平: {aligned['current_load']:.4f} kW (当前) vs {aligned['historical_load']:.4f} kW (历史)\n")
+                        f.write(f"  负荷差异: {aligned['load_difference']:+.4f} kW ({aligned['load_difference_percent']:+.1f}%)\n")
+                        if aligned.get('environment_diff'):
+                            f.write(f"  环境特征差异:\n")
+                            for feat, diff in aligned['environment_diff'].items():
+                                feat_name = feat.replace('_current', '')
+                                f.write(f"    • {feat_name}: {diff['current']:.2f} (当前) vs {diff['historical']:.2f} (历史), 差异: {diff['diff']:+.2f}\n")
+                
+                # 5.3 显著差异阶段
+                if comp.get('significant_differences'):
+                    f.write("\n\n▶ 差异显著的负荷阶段\n")
+                    f.write("-"*80 + "\n")
+                    for diff in comp['significant_differences']:
+                        f.write(f"\n阶段{diff['current_stage']} (时间: {diff['time_range']}):\n")
+                        f.write(f"  负荷变化: {diff['load_change']:+.4f} kW ({diff['load_change_percent']:+.1f}%)\n")
+                        f.write(f"  变化类型: {diff['change_type']}\n")
+                        f.write(f"  行为解释:\n")
+                        for exp in diff['explanations']:
+                            f.write(f"    • {exp}\n")
+                
+                # 5.4 总体行为解释
+                if comp.get('behavior_explanations'):
+                    f.write("\n\n▶ 总体行为模式分析\n")
+                    f.write("-"*80 + "\n")
+                    for exp in comp['behavior_explanations']:
+                        f.write(f"{exp}\n")
             
             f.write("\n" + "="*80 + "\n")
             f.write("报告生成完成\n")
