@@ -1168,6 +1168,8 @@ def compare_with_historical_stages(current_segments, historical_segments,
                     'historical_stage': aligned['historical_stage'],
                     'time_range': aligned['current_time_range'],
                     'historical_time_range': aligned['historical_time_range'],
+                    'current_load': aligned['current_load'],
+                    'historical_load': aligned['historical_load'],
                     'load_change': aligned['load_difference'],
                     'load_change_percent': aligned['load_difference_percent'],
                     'time_shift': aligned['time_shift'],
@@ -1548,6 +1550,221 @@ def compare_predicted_with_multiple_historical_stages(predicted_segments, histor
             'summary': {},
             'error': str(e)
         }
+
+def prepare_historical_data_for_comparison(ts, feat_df, target_date, comparison_days=[1, 3, 7]):
+    """
+    准备历史数据用于多历史时期对比分析
+    
+    参数:
+    - ts: 原始时间序列数据（包含负荷和环境特征）
+    - feat_df: 特征数据框
+    - target_date: 预测目标日期
+    - comparison_days: 要对比的历史天数列表，默认为[1, 3, 7]天前
+    
+    返回:
+    - historical_data_dict: 历史数据字典，格式为 {days_ago: {'segments': [...], 'feat_df': df, 'times': [...], 'load': [...]}}
+    """
+    try:
+        historical_data_dict = {}
+        step_per_day = 96  # 24小时 * 4个15分钟
+        step_minutes = 15
+        
+        for days_ago in comparison_days:
+            try:
+                # 计算历史日期
+                historical_date = target_date - timedelta(days=days_ago)
+                historical_date_obj = historical_date.date()
+                
+                # 获取历史日期的数据
+                hist_day_series = ts[ts.index.date == historical_date_obj]
+                
+                if hist_day_series.empty:
+                    print(f"⚠️ 未找到{days_ago}天前({historical_date_obj})的历史数据，跳过")
+                    continue
+                
+                # 生成标准时间点
+                base = pd.Timestamp(historical_date_obj)
+                hist_day_index = pd.date_range(start=base, periods=step_per_day, freq=f"{step_minutes}T")
+                
+                # 重采样历史数据到标准时间点
+                if len(hist_day_series) != step_per_day:
+                    hist_load = hist_day_series['load'].reindex(hist_day_index, method='nearest')
+                else:
+                    hist_load = hist_day_series['load']
+                
+                # 平滑处理
+                hist_load_smooth = gaussian_filter1d(hist_load.values.astype(float), sigma=2.0)
+                
+                # 使用HMM对历史负荷进行阶段划分
+                try:
+                    min_segment_length = max(6, len(hist_load_smooth) // 8)
+                    _, _, hist_segments = hmm_load_segmentation(
+                        hist_load_smooth,
+                        n_states='auto',
+                        min_states=3,
+                        max_states=5,
+                        min_segment_length=min_segment_length
+                    )
+                except Exception as e:
+                    print(f"⚠️ {days_ago}天前的HMM划分失败，使用简单分段: {e}")
+                    _, _, hist_segments = simple_load_segmentation(hist_load_smooth, n_segments=4)
+                
+                # 准备历史日期的特征数据
+                hist_feat_rows = []
+                for t in hist_day_index:
+                    if t in feat_df.index:
+                        hist_feat_rows.append(feat_df.loc[t])
+                    else:
+                        # 如果特征数据中没有该时间点，使用最近的时间点
+                        nearest_idx = feat_df.index.get_indexer([t], method='nearest')[0]
+                        hist_feat_rows.append(feat_df.iloc[nearest_idx])
+                
+                hist_feat_df = pd.DataFrame(hist_feat_rows, index=hist_day_index)
+                
+                # 保存历史数据
+                historical_data_dict[days_ago] = {
+                    'segments': hist_segments,
+                    'feat_df': hist_feat_df,
+                    'times': hist_day_index.tolist(),
+                    'load': hist_load_smooth
+                }
+                
+                print(f"✅ 成功准备{days_ago}天前({historical_date_obj})的历史数据，识别出{len(hist_segments)}个阶段")
+                
+            except Exception as e:
+                print(f"❌ 准备{days_ago}天前的历史数据失败: {e}")
+                continue
+        
+        return historical_data_dict
+        
+    except Exception as e:
+        print(f"❌ 准备历史数据失败: {e}")
+        import traceback
+        traceback.print_exc()
+        return {}
+
+def generate_multi_historical_comparison_report(multi_comparison, output_path):
+    """
+    生成多历史时期对比分析报告（文本格式）
+    
+    参数:
+    - multi_comparison: 多历史时期对比分析结果字典
+    - output_path: 报告保存路径
+    """
+    try:
+        with open(output_path, 'w', encoding='utf-8') as f:
+            f.write("="*80 + "\n")
+            f.write("多历史时期负荷对比分析报告\n")
+            f.write("="*80 + "\n\n")
+            
+            # 1. 阶段数量变化趋势
+            if multi_comparison['summary'].get('stage_count_trends'):
+                f.write("【1】阶段数量变化趋势\n")
+                f.write("-"*80 + "\n")
+                for sc in multi_comparison['summary']['stage_count_trends']:
+                    days_ago = sc['days_ago']
+                    change = sc['change']
+                    change_pct = (change / sc['historical_count'] * 100) if sc['historical_count'] > 0 else 0
+                    f.write(f"\n与{days_ago}天前相比:\n")
+                    f.write(f"  预测日阶段数: {sc['predicted_count']}\n")
+                    f.write(f"  历史阶段数: {sc['historical_count']}\n")
+                    f.write(f"  变化: {change:+d} 个阶段 ({change_pct:+.1f}%)\n")
+            
+            # 2. 与各历史时期的详细对比
+            for days_ago in sorted(multi_comparison['comparisons'].keys()):
+                comp = multi_comparison['comparisons'][days_ago]
+                
+                f.write(f"\n\n{'='*80}\n")
+                f.write(f"【与{days_ago}天前的详细对比】\n")
+                f.write(f"{'='*80}\n\n")
+                
+                # 阶段数量对比
+                scc = comp.get('stage_count_comparison', {})
+                f.write("▶ 阶段数量对比:\n")
+                f.write(f"  当前阶段数: {scc.get('current_count', 0)}\n")
+                f.write(f"  历史阶段数: {scc.get('historical_count', 0)}\n")
+                f.write(f"  变化趋势: {scc.get('trend', 'N/A')}\n")
+                if scc.get('reasons'):
+                    f.write("  原因分析:\n")
+                    for reason in scc['reasons']:
+                        f.write(f"    {reason}\n")
+                
+                # 显著差异阶段
+                sig_diffs = comp.get('significant_differences', [])
+                if sig_diffs:
+                    f.write(f"\n▶ 发现 {len(sig_diffs)} 个显著差异的负荷阶段:\n")
+                    f.write("-"*80 + "\n")
+                    
+                    for i, diff in enumerate(sig_diffs, 1):
+                        f.write(f"\n【差异阶段 {i}】\n")
+                        f.write(f"  预测日阶段 {diff['current_stage']} ↔ 历史阶段 {diff['historical_stage']}\n")
+                        f.write(f"  时间范围:\n")
+                        f.write(f"    预测日: {diff.get('time_range', 'N/A')}\n")
+                        f.write(f"    历史: {diff.get('historical_time_range', 'N/A')}\n")
+                        
+                        # 时间偏移
+                        if 'time_shift' in diff and abs(diff['time_shift']) >= 0.5:
+                            f.write(f"  ⏰ 时间偏移: {diff['time_shift']:+.1f} 小时 ({diff.get('shift_direction', '')})\n")
+                        
+                        # 负荷变化
+                        f.write(f"  📊 负荷变化:\n")
+                        f.write(f"    预测日负荷: {diff.get('current_load', 'N/A')}\n")
+                        f.write(f"    历史负荷: {diff.get('historical_load', 'N/A')}\n")
+                        f.write(f"    变化量: {diff['load_change']:+.4f} ({diff['load_change_percent']:+.1f}%)\n")
+                        f.write(f"    变化类型: {diff['change_type']}\n")
+                        
+                        # 行为解释
+                        if diff.get('explanations'):
+                            f.write(f"  🔍 行为解释:\n")
+                            for exp in diff['explanations']:
+                                f.write(f"    • {exp}\n")
+                
+                # 行为解释总结
+                behavior_exps = comp.get('behavior_explanations', [])
+                if behavior_exps:
+                    f.write(f"\n▶ 整体行为模式分析:\n")
+                    for exp in behavior_exps:
+                        f.write(f"  • {exp}\n")
+            
+            # 3. 跨时期趋势总结
+            if multi_comparison['summary'].get('behavior_patterns'):
+                f.write(f"\n\n{'='*80}\n")
+                f.write("【跨时期行为模式总结】\n")
+                f.write(f"{'='*80}\n\n")
+                for pattern in multi_comparison['summary']['behavior_patterns']:
+                    f.write(f"• {pattern}\n")
+            
+            # 4. 时间偏移趋势
+            if multi_comparison['summary'].get('time_shift_trends'):
+                f.write(f"\n▶ 时间偏移趋势:\n")
+                f.write("-"*80 + "\n")
+                for tst in multi_comparison['summary']['time_shift_trends']:
+                    f.write(f"\n与{tst['days_ago']}天前相比:\n")
+                    f.write(f"  显著偏移阶段数: {tst['shift_count']}\n")
+                    f.write(f"  右移(推迟)阶段数: {tst['right_shift_count']}\n")
+                    f.write(f"  左移(提前)阶段数: {tst['left_shift_count']}\n")
+                    f.write(f"  主导方向: {tst['dominant_direction']}\n")
+            
+            # 5. 负荷变化趋势
+            if multi_comparison['summary'].get('load_trends'):
+                f.write(f"\n▶ 负荷变化趋势:\n")
+                f.write("-"*80 + "\n")
+                for lt in multi_comparison['summary']['load_trends']:
+                    f.write(f"\n与{lt['days_ago']}天前相比:\n")
+                    f.write(f"  显著差异阶段总数: {lt['total_significant']}\n")
+                    f.write(f"  负荷增加阶段数: {lt['increase_count']}\n")
+                    f.write(f"  负荷减少阶段数: {lt['decrease_count']}\n")
+            
+            f.write("\n\n" + "="*80 + "\n")
+            f.write("报告结束\n")
+            f.write("="*80 + "\n")
+        
+        print(f"✅ 多历史时期对比分析报告已保存到: {output_path}")
+        
+    except Exception as e:
+        print(f"❌ 生成多历史时期对比分析报告失败: {e}")
+        import traceback
+        traceback.print_exc()
 
 def generate_explanation_report(explanations, output_path):
     """
@@ -2620,6 +2837,47 @@ def plot_single_day_prediction(ts, feat_df, pred_date, pred_values, pred_times, 
             if seg['key_factors']:
                 print(f"      关键因素: {seg['key_factors'][0]}")
         
+        # 🆕 多历史时期对比分析
+        print("\n🔍 开始多历史时期负荷对比分析...")
+        multi_comparison = None
+        multi_comparison_report_path = None
+        
+        try:
+            # 准备历史数据（1, 3, 7天前）
+            historical_data_dict = prepare_historical_data_for_comparison(
+                ts, feat_df, pred_date, comparison_days=[1, 3, 7]
+            )
+            
+            if historical_data_dict:
+                # 执行多历史时期对比分析
+                multi_comparison = compare_predicted_with_multiple_historical_stages(
+                    segments,
+                    historical_data_dict,
+                    feat_df.loc[day_index] if len(day_index) > 0 else feat_df,
+                    pred_times,
+                    pred_resampled.values,
+                    comparison_days=[1, 3, 7]
+                )
+                
+                # 保存多历史时期对比分析报告
+                multi_comparison_report_path = os.path.join(out_dir, f'multi_historical_comparison_{pred_date_obj.strftime("%Y%m%d")}.txt')
+                generate_multi_historical_comparison_report(multi_comparison, multi_comparison_report_path)
+                
+                print(f"✅ 多历史时期对比分析完成，报告已保存")
+                
+                # 打印简要对比结果
+                print("\n📊 多历史时期对比摘要:")
+                if multi_comparison['summary'].get('behavior_patterns'):
+                    for pattern in multi_comparison['summary']['behavior_patterns'][:3]:  # 只打印前3条
+                        print(f"   • {pattern}")
+            else:
+                print("⚠️ 无足够历史数据进行多历史时期对比分析")
+                
+        except Exception as e:
+            print(f"⚠️ 多历史时期对比分析失败: {e}")
+            import traceback
+            traceback.print_exc()
+        
         return {
             'date': pred_date_obj,
             'actual_mean': actual_mean,
@@ -2634,7 +2892,9 @@ def plot_single_day_prediction(ts, feat_df, pred_date, pred_values, pred_times, 
             'state_means': state_means.tolist(),
             'explanations': explanations,
             'explanation_report': report_path,
-            'explanation_viz': viz_path
+            'explanation_viz': viz_path,
+            'multi_comparison': multi_comparison,
+            'multi_comparison_report': multi_comparison_report_path
         }
         
     except Exception as e:
@@ -2769,6 +3029,15 @@ def predict_mode():
                         with open(explanation_json_path, 'w', encoding='utf-8') as f:
                             json.dump(result['explanations'], f, ensure_ascii=False, indent=2)
                         print(f"✅ 可解释性分析(JSON)已保存到: {explanation_json_path}")
+                    
+                    # 保存多历史时期对比分析结果（JSON格式）
+                    if 'multi_comparison' in result and result['multi_comparison']:
+                        import json
+                        multi_comparison_json_path = os.path.join(prediction_dir, f"multi_historical_comparison_{target_datetime.date().strftime('%Y%m%d')}.json")
+                        with open(multi_comparison_json_path, 'w', encoding='utf-8') as f:
+                            json.dump(result['multi_comparison'], f, ensure_ascii=False, indent=2)
+                        print(f"✅ 多历史时期对比分析(JSON)已保存到: {multi_comparison_json_path}")
+
 
                 print(f"\n🎉 预测完成！")
 
