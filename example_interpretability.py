@@ -84,42 +84,126 @@ def generate_sample_load_data():
     
     return df
 
-def segment_load_by_threshold(load_values, n_segments=4):
+def segment_load_by_threshold(load_values, n_segments=4, min_segment_length=6):
     """
-    基于负荷水平进行简单分段
+    基于负荷水平进行改进的智能分段
+    
+    使用时间序列平滑、变化点检测和最小段长度约束来创建更精准的阶段划分。
     
     Args:
         load_values: 负荷值数组
-        n_segments: 目标段数
+        n_segments: 目标段数（建议范围：3-8）
+        min_segment_length: 最小段长度（时间点数），默认6个点（1.5小时）
         
     Returns:
         list: 段落信息 [(start_idx, end_idx, state, mean_load), ...]
     """
     load_values = np.array(load_values)
+    n = len(load_values)
     
-    # 使用K-means聚类思想划分状态
-    thresholds = np.percentile(load_values, np.linspace(0, 100, n_segments + 1))
-    states = np.digitize(load_values, thresholds[1:-1])
+    # 步骤1: 对负荷值进行平滑处理，减少噪声影响
+    # 使用移动平均窗口大小为5（约1小时）
+    window_size = 5
+    smoothed_load = np.convolve(load_values, np.ones(window_size)/window_size, mode='same')
     
-    # 合并连续的相同状态
-    segments = []
+    # 步骤2: 计算一阶导数（变化率）来识别显著变化点
+    # 使用中心差分法计算导数
+    derivative = np.zeros_like(smoothed_load)
+    derivative[1:-1] = (smoothed_load[2:] - smoothed_load[:-2]) / 2
+    derivative[0] = smoothed_load[1] - smoothed_load[0]
+    derivative[-1] = smoothed_load[-1] - smoothed_load[-2]
+    
+    # 步骤3: 识别显著的变化点
+    # 计算导数的标准差作为阈值
+    derivative_std = np.std(derivative)
+    derivative_threshold = derivative_std * 0.5  # 使用0.5倍标准差作为阈值
+    
+    # 找出导数绝对值较大的点（显著变化点）
+    change_points = []
+    for i in range(1, n - 1):
+        # 如果导数符号改变或导数绝对值超过阈值，标记为变化点
+        if (abs(derivative[i]) > derivative_threshold and 
+            (derivative[i] * derivative[i-1] < 0 or abs(derivative[i]) > abs(derivative[i-1]) * 1.5)):
+            change_points.append(i)
+    
+    # 步骤4: 基于变化点和负荷水平进行聚类分段
+    # 使用K-means思想对平滑后的负荷进行聚类
+    thresholds = np.percentile(smoothed_load, np.linspace(0, 100, n_segments + 1))
+    states = np.digitize(smoothed_load, thresholds[1:-1])
+    
+    # 步骤5: 识别初始段
+    initial_segments = []
     current_state = states[0]
     start_idx = 0
     
-    for i in range(1, len(states)):
-        if states[i] != current_state:
-            # 当前段结束
-            segment_load = load_values[start_idx:i]
-            segments.append((start_idx, i-1, current_state, np.mean(segment_load)))
-            # 开始新段
-            start_idx = i
-            current_state = states[i]
+    for i in range(1, n):
+        # 如果状态改变或遇到显著变化点，结束当前段
+        if states[i] != current_state or i in change_points:
+            if i - start_idx >= 2:  # 至少2个点才形成段
+                segment_load = load_values[start_idx:i]
+                initial_segments.append((start_idx, i-1, current_state, np.mean(segment_load)))
+                start_idx = i
+                current_state = states[i]
     
     # 添加最后一段
-    segment_load = load_values[start_idx:]
-    segments.append((start_idx, len(states)-1, current_state, np.mean(segment_load)))
+    if start_idx < n:
+        segment_load = load_values[start_idx:]
+        initial_segments.append((start_idx, n-1, current_state, np.mean(segment_load)))
     
-    return segments
+    # 步骤6: 合并短小和相似的段
+    merged_segments = []
+    i = 0
+    
+    while i < len(initial_segments):
+        start_idx, end_idx, state, mean_load = initial_segments[i]
+        segment_length = end_idx - start_idx + 1
+        
+        # 如果当前段太短，尝试与相邻段合并
+        if segment_length < min_segment_length and len(merged_segments) > 0:
+            # 与前一个段合并
+            prev_start, prev_end, prev_state, prev_mean = merged_segments[-1]
+            combined_load = np.mean(load_values[prev_start:end_idx+1])
+            
+            # 选择负荷水平更接近的状态
+            if abs(combined_load - thresholds[prev_state]) <= abs(combined_load - thresholds[state]):
+                final_state = prev_state
+            else:
+                final_state = state
+            
+            merged_segments[-1] = (prev_start, end_idx, final_state, combined_load)
+        else:
+            # 如果段足够长，或者是第一个段，直接添加
+            merged_segments.append((start_idx, end_idx, state, mean_load))
+        
+        i += 1
+    
+    # 步骤7: 进一步合并负荷水平相似的相邻段
+    final_segments = []
+    i = 0
+    
+    while i < len(merged_segments):
+        start_idx, end_idx, state, mean_load = merged_segments[i]
+        
+        # 检查是否可以与下一个段合并
+        if i < len(merged_segments) - 1:
+            next_start, next_end, next_state, next_mean = merged_segments[i + 1]
+            
+            # 如果相邻两段的负荷水平差异小于15%，合并它们
+            load_diff_pct = abs(next_mean - mean_load) / mean_load * 100 if mean_load > 0 else 0
+            
+            if load_diff_pct < 15:
+                # 合并两段
+                combined_load = np.mean(load_values[start_idx:next_end+1])
+                # 选择负荷水平更高的状态（保持语义一致性）
+                final_state = state if mean_load >= next_mean else next_state
+                final_segments.append((start_idx, next_end, final_state, combined_load))
+                i += 2  # 跳过下一个段
+                continue
+        
+        final_segments.append((start_idx, end_idx, state, mean_load))
+        i += 1
+    
+    return final_segments
 
 def analyze_segments(segments, df):
     """

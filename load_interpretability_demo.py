@@ -77,23 +77,119 @@ def generate_demo_data():
     
     return df
 
-def simple_segmentation(load_values, n_segments=4):
+def simple_segmentation(load_values, n_segments=4, min_segment_length=6):
     """
-    简单的负荷分段方法（基于分位数）
+    改进的负荷分段方法（使用时间序列分析和变化点检测）
+    
+    Args:
+        load_values: 负荷值数组
+        n_segments: 目标段数（建议范围：3-8）
+        min_segment_length: 最小段长度（时间点数），默认6个点（1.5小时）
+        
+    Returns:
+        states: 状态序列
+        state_means: 各状态的平均负荷
+        segments: 段落信息列表
     """
     load_values = np.array(load_values)
+    n = len(load_values)
     
-    # 计算分位数阈值
+    # 步骤1: 对负荷值进行平滑处理，减少噪声影响
+    window_size = 5
+    smoothed_load = np.convolve(load_values, np.ones(window_size)/window_size, mode='same')
+    
+    # 步骤2: 计算一阶导数（变化率）来识别显著变化点
+    derivative = np.zeros_like(smoothed_load)
+    derivative[1:-1] = (smoothed_load[2:] - smoothed_load[:-2]) / 2
+    derivative[0] = smoothed_load[1] - smoothed_load[0]
+    derivative[-1] = smoothed_load[-1] - smoothed_load[-2]
+    
+    # 步骤3: 识别显著的变化点
+    derivative_std = np.std(derivative)
+    derivative_threshold = derivative_std * 0.5
+    
+    change_points = []
+    for i in range(1, n - 1):
+        if (abs(derivative[i]) > derivative_threshold and 
+            (derivative[i] * derivative[i-1] < 0 or abs(derivative[i]) > abs(derivative[i-1]) * 1.5)):
+            change_points.append(i)
+    
+    # 步骤4: 基于变化点和负荷水平进行聚类分段
     quantiles = np.linspace(0, 1, n_segments + 1)
-    thresholds = np.quantile(load_values, quantiles)
+    thresholds = np.quantile(smoothed_load, quantiles)
+    states = np.digitize(smoothed_load, thresholds[1:-1])
     
-    # 分配状态
-    states = np.digitize(load_values, thresholds[1:-1])
+    # 步骤5: 识别初始段
+    initial_segments = []
+    current_state = states[0]
+    start_idx = 0
+    
+    for i in range(1, n):
+        if states[i] != current_state or i in change_points:
+            if i - start_idx >= 2:
+                segment_load = load_values[start_idx:i]
+                initial_segments.append((start_idx, i-1, current_state, np.mean(segment_load)))
+                start_idx = i
+                current_state = states[i]
+    
+    # 添加最后一段
+    if start_idx < n:
+        segment_load = load_values[start_idx:]
+        initial_segments.append((start_idx, n-1, current_state, np.mean(segment_load)))
+    
+    # 步骤6: 合并短小段
+    merged_segments = []
+    i = 0
+    
+    while i < len(initial_segments):
+        start_idx, end_idx, state, mean_load = initial_segments[i]
+        segment_length = end_idx - start_idx + 1
+        
+        if segment_length < min_segment_length and len(merged_segments) > 0:
+            prev_start, prev_end, prev_state, prev_mean = merged_segments[-1]
+            combined_load = np.mean(load_values[prev_start:end_idx+1])
+            
+            if abs(combined_load - thresholds[prev_state]) <= abs(combined_load - thresholds[state]):
+                final_state = prev_state
+            else:
+                final_state = state
+            
+            merged_segments[-1] = (prev_start, end_idx, final_state, combined_load)
+        else:
+            merged_segments.append((start_idx, end_idx, state, mean_load))
+        
+        i += 1
+    
+    # 步骤7: 合并负荷水平相似的相邻段
+    final_segments = []
+    i = 0
+    
+    while i < len(merged_segments):
+        start_idx, end_idx, state, mean_load = merged_segments[i]
+        
+        if i < len(merged_segments) - 1:
+            next_start, next_end, next_state, next_mean = merged_segments[i + 1]
+            load_diff_pct = abs(next_mean - mean_load) / mean_load * 100 if mean_load > 0 else 0
+            
+            if load_diff_pct < 15:
+                combined_load = np.mean(load_values[start_idx:next_end+1])
+                final_state = state if mean_load >= next_mean else next_state
+                final_segments.append((start_idx, next_end, final_state, combined_load))
+                i += 2
+                continue
+        
+        final_segments.append((start_idx, end_idx, state, mean_load))
+        i += 1
+    
+    # 重新构建状态序列和状态平均值
+    final_states = np.zeros(n, dtype=int)
+    for start_idx, end_idx, state, _ in final_segments:
+        final_states[start_idx:end_idx+1] = state
     
     # 计算每个状态的平均值
     state_means = []
     for state in range(n_segments):
-        state_mask = (states == state)
+        state_mask = (final_states == state)
         if np.any(state_mask):
             state_mean = np.mean(load_values[state_mask])
             state_means.append(state_mean)
@@ -102,24 +198,7 @@ def simple_segmentation(load_values, n_segments=4):
     
     state_means = np.array(state_means)
     
-    # 识别连续段
-    segments = []
-    current_state = states[0]
-    start_idx = 0
-    
-    for i in range(1, len(states)):
-        if states[i] != current_state:
-            end_idx = i - 1
-            segment_load = np.mean(load_values[start_idx:i])
-            segments.append((start_idx, end_idx, current_state, segment_load))
-            start_idx = i
-            current_state = states[i]
-    
-    # 添加最后一段
-    segment_load = np.mean(load_values[start_idx:])
-    segments.append((start_idx, len(states) - 1, current_state, segment_load))
-    
-    return states, state_means, segments
+    return final_states, state_means, final_segments
 
 def analyze_segment_features(segments, feat_df, pred_times):
     """
