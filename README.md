@@ -17,6 +17,7 @@
 - **影响因素识别** - 识别温度、湿度、时间段等关键影响因素
 - **趋势变化解释** - 分析阶段间负荷变化的原因
 - **特征重要性分析** - 量化评估各因素的影响程度
+- **🆕 多历史时期对比分析** - 自动对比预测日与历史负荷（7/3/1天前），分析阶段数量、时间偏移、负荷变化
 - **自动报告生成** - 生成详细的文本报告和可视化图表
 - **多格式输出** - 支持TXT、PNG、JSON多种格式
 
@@ -34,6 +35,7 @@ python train_household_forecast.py
 #   - 预测结果图（含阶段划分）
 #   - 可解释性分析报告（TXT）
 #   - 可解释性可视化图（PNG）
+#   - 🆕 多历史时期对比分析报告（TXT + JSON）
 #   - 结构化分析数据（JSON）
 ```
 
@@ -51,7 +53,9 @@ python load_interpretability_demo.py
 ## 📖 使用文档
 
 - **[📘 可解释性功能使用指南](README_INTERPRETABILITY.md)** - 详细的使用说明和示例
+- **[🆕 预测模式中的多历史时期对比分析](PREDICTION_MODE_MULTI_HISTORICAL_COMPARISON.md)** - 多历史时期对比功能说明
 - [可解释性模型技术文档](INTERPRETABILITY_MODEL.md) - 技术细节和API文档
+- [多历史时期对比示例](MULTI_HISTORICAL_COMPARISON_EXAMPLE.md) - 对比分析示例
 - [实现总结](IMPLEMENTATION_SUMMARY.md) - 实现概要
 - [快速参考](QUICK_REFERENCE.md) - API快速参考
 
@@ -63,10 +67,12 @@ python load_interpretability_demo.py
 
 ```
 predictions/
-├── prediction_with_stages_20240115.png    # 预测结果与阶段划分图
-├── explanation_report_20240115.txt        # 详细分析报告
-├── explanation_viz_20240115.png           # 可视化分析图表  
-└── explanation_20240115.json              # 结构化分析数据
+├── prediction_with_stages_20240115.png           # 预测结果与阶段划分图
+├── explanation_report_20240115.txt               # 详细分析报告
+├── explanation_viz_20240115.png                  # 可视化分析图表
+├── multi_historical_comparison_20240115.txt      # 🆕 多历史时期对比报告
+├── multi_historical_comparison_20240115.json     # 🆕 对比分析结构化数据
+└── explanation_20240115.json                     # 结构化分析数据
 ```
 
 ### 报告内容示例
@@ -134,9 +140,10 @@ pip install tensorflow
 2. 📊 分析每个阶段的负荷水平和特征
 3. 🔍 识别影响负荷的关键因素（温度、湿度、时间等）
 4. 📈 解释阶段间负荷变化的原因
-5. 📝 生成详细的文本分析报告
-6. 🎨 生成多维度可视化图表
-7. 💾 导出JSON格式的结构化数据
+5. 🆕 自动对比预测日与历史负荷（7/3/1天前），分析阶段数量变化、时间偏移、负荷变化，结合人的行为提供解释
+6. 📝 生成详细的文本分析报告
+7. 🎨 生成多维度可视化图表
+8. 💾 导出JSON格式的结构化数据
 
 详细使用方法请参考 [📘 可解释性功能使用指南](README_INTERPRETABILITY.md)
 
