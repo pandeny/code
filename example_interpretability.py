@@ -89,7 +89,7 @@ def segment_load_by_threshold(load_values, n_segments=4, min_segment_length=6):
     基于负荷水平进行改进的智能分段
     
     使用时间序列平滑、变化点检测和最小段长度约束来创建更精准的阶段划分。
-    增强版：使用时间特征的正余弦编码让时间成为连续的
+    增强版：使用时间特征的正余弦编码让时间成为连续的，并检测负荷峰值/波动区作为窗口划分阶段
     
     Args:
         load_values: 负荷值数组
@@ -103,6 +103,7 @@ def segment_load_by_threshold(load_values, n_segments=4, min_segment_length=6):
     n = len(load_values)
     
     # 构建时间特征（正余弦编码让时间成为连续的）
+    features = []
     time_features = []
     for i in range(n):
         hour = (i * 0.25) % 24  # 假设15分钟间隔
@@ -112,12 +113,47 @@ def segment_load_by_threshold(load_values, n_segments=4, min_segment_length=6):
             np.sin(2 * np.pi * (i % 96) / 96),  # 日内位置编码
             np.cos(2 * np.pi * (i % 96) / 96)
         ])
-    time_features = np.array(time_features)
+    features.append(np.array(time_features))
+    time_features = features[0]  # 提取时间特征数组
     
     # 步骤1: 对负荷值进行平滑处理，减少噪声影响
     # 使用移动平均窗口大小为5（约1小时）
     window_size = 5
     smoothed_load = np.convolve(load_values, np.ones(window_size)/window_size, mode='same')
+    
+    # 检测负荷峰值/波动区域
+    peak_window_size = 8  # 2小时窗口
+    peak_zones = []
+    fluctuation_zones = []
+    
+    for i in range(peak_window_size, n - peak_window_size):
+        window = smoothed_load[i-peak_window_size:i+peak_window_size]
+        center_val = smoothed_load[i]
+        
+        # 峰值检测：当前点是局部最大值
+        if center_val == np.max(window) and center_val > np.percentile(smoothed_load, 75):
+            peak_zones.append(i)
+        
+        # 波动检测：窗口内标准差较大
+        window_std = np.std(window)
+        if window_std > np.std(smoothed_load) * 0.8:
+            fluctuation_zones.append(i)
+    
+    # 合并相邻的峰值/波动区域，形成窗口边界
+    def merge_zones(zones, min_gap=6):
+        if not zones:
+            return []
+        zones = sorted(set(zones))
+        merged = [zones[0]]
+        for z in zones[1:]:
+            if z - merged[-1] < min_gap:
+                continue
+            merged.append(z)
+        return merged
+    
+    peak_boundaries = merge_zones(peak_zones)
+    fluctuation_boundaries = merge_zones(fluctuation_zones)
+    important_boundaries = sorted(set(peak_boundaries + fluctuation_boundaries))
     
     # 步骤2: 计算一阶导数（变化率）来识别显著变化点
     # 使用中心差分法计算导数
@@ -147,9 +183,21 @@ def segment_load_by_threshold(load_values, n_segments=4, min_segment_length=6):
     thresholds = np.percentile(smoothed_load, np.linspace(0, 100, n_segments + 1))
     states = np.digitize(smoothed_load, thresholds[1:-1])
     
+    # 在重要边界处强制分割，确保峰值/波动区作为独立阶段
+    for boundary in important_boundaries:
+        if 0 < boundary < n-1:
+            load_change = abs(load_normalized[boundary] - load_normalized[boundary-1])
+            if load_change > 0.15:
+                states[boundary] = max(0, states[boundary])
+    
     # 使用时间特征优化状态边界
     for i in range(1, n - 1):
         if states[i] != states[i-1]:
+            # 如果在重要边界附近，保持分割
+            near_boundary = any(abs(i - b) < 3 for b in important_boundaries)
+            if near_boundary:
+                continue
+            
             # 计算时间相似度
             time_sim_prev = np.dot(time_features[i], time_features[i-1])
             
