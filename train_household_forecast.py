@@ -1382,6 +1382,173 @@ def compare_with_historical_stages(current_segments, historical_segments,
             'error': str(e)
         }
 
+def compare_predicted_with_multiple_historical_stages(predicted_segments, historical_data_dict,
+                                                      predicted_feat_df, predicted_times, predicted_load,
+                                                      comparison_days=[1, 3, 7]):
+    """
+    将预测日负荷与多个历史负荷（7/3/1天前）进行对比分析
+    
+    参数:
+    - predicted_segments: 预测日负荷分段信息 [(start_idx, end_idx, state, mean_load), ...]
+    - historical_data_dict: 历史数据字典，格式为 {days_ago: {'segments': [...], 'feat_df': df, 'times': [...], 'load': [...]}}
+    - predicted_feat_df: 预测日特征数据框
+    - predicted_times: 预测日时间点列表
+    - predicted_load: 预测日负荷值数组
+    - comparison_days: 要对比的历史天数列表，默认为[1, 3, 7]天前
+    
+    返回:
+    - multi_comparison: 包含与多个历史时期对比分析结果的字典
+    """
+    try:
+        multi_comparison = {
+            'comparison_days': comparison_days,
+            'comparisons': {},
+            'summary': {
+                'stage_count_trends': [],
+                'load_trends': [],
+                'time_shift_trends': [],
+                'behavior_patterns': []
+            }
+        }
+        
+        # 对每个历史时期进行对比
+        for days_ago in comparison_days:
+            if days_ago not in historical_data_dict:
+                print(f"⚠️ {days_ago}天前的历史数据不存在，跳过")
+                continue
+            
+            hist_data = historical_data_dict[days_ago]
+            
+            # 调用单次对比函数
+            comparison = compare_with_historical_stages(
+                predicted_segments, hist_data['segments'],
+                predicted_feat_df, hist_data['feat_df'],
+                predicted_times, hist_data['times'],
+                predicted_load, hist_data['load']
+            )
+            
+            multi_comparison['comparisons'][days_ago] = comparison
+        
+        # 生成跨时期的趋势总结
+        if len(multi_comparison['comparisons']) > 0:
+            # 1. 阶段数量变化趋势
+            stage_counts = []
+            for days_ago in sorted(multi_comparison['comparisons'].keys()):
+                comp = multi_comparison['comparisons'][days_ago]
+                scc = comp.get('stage_count_comparison', {})
+                stage_counts.append({
+                    'days_ago': days_ago,
+                    'predicted_count': scc.get('current_count', 0),
+                    'historical_count': scc.get('historical_count', 0),
+                    'change': scc.get('change', 0)
+                })
+            
+            multi_comparison['summary']['stage_count_trends'] = stage_counts
+            
+            # 分析阶段数量变化趋势
+            if len(stage_counts) > 1:
+                changes = [sc['change'] for sc in stage_counts]
+                if all(c > 0 for c in changes):
+                    multi_comparison['summary']['behavior_patterns'].append(
+                        f'与过去{comparison_days}天相比，负荷阶段数持续增加，说明用电行为逐渐多样化和复杂化'
+                    )
+                elif all(c < 0 for c in changes):
+                    multi_comparison['summary']['behavior_patterns'].append(
+                        f'与过去{comparison_days}天相比，负荷阶段数持续减少，说明用电行为逐渐规律化和简化'
+                    )
+                else:
+                    multi_comparison['summary']['behavior_patterns'].append(
+                        f'与过去{comparison_days}天相比，负荷阶段数变化不一致，说明用电模式存在波动'
+                    )
+            
+            # 2. 负荷变化趋势分析
+            for days_ago in sorted(multi_comparison['comparisons'].keys()):
+                comp = multi_comparison['comparisons'][days_ago]
+                sig_diffs = comp.get('significant_differences', [])
+                
+                if sig_diffs:
+                    increase_count = sum(1 for d in sig_diffs if d['load_change'] > 0)
+                    decrease_count = len(sig_diffs) - increase_count
+                    
+                    multi_comparison['summary']['load_trends'].append({
+                        'days_ago': days_ago,
+                        'increase_count': increase_count,
+                        'decrease_count': decrease_count,
+                        'total_significant': len(sig_diffs)
+                    })
+            
+            # 3. 时间偏移趋势分析
+            for days_ago in sorted(multi_comparison['comparisons'].keys()):
+                comp = multi_comparison['comparisons'][days_ago]
+                sig_diffs = comp.get('significant_differences', [])
+                
+                if sig_diffs:
+                    right_shift_count = sum(1 for d in sig_diffs if d.get('time_shift', 0) >= 1.0)
+                    left_shift_count = sum(1 for d in sig_diffs if d.get('time_shift', 0) <= -1.0)
+                    shift_count = right_shift_count + left_shift_count
+                    
+                    if shift_count > 0:
+                        multi_comparison['summary']['time_shift_trends'].append({
+                            'days_ago': days_ago,
+                            'shift_count': shift_count,
+                            'right_shift_count': right_shift_count,
+                            'left_shift_count': left_shift_count,
+                            'dominant_direction': '右移(推迟)' if right_shift_count > left_shift_count else ('左移(提前)' if left_shift_count > right_shift_count else '混合')
+                        })
+            
+            # 4. 生成综合行为模式解释
+            if multi_comparison['summary']['time_shift_trends']:
+                # 分析时间偏移的一致性
+                shift_trends = multi_comparison['summary']['time_shift_trends']
+                dominant_dirs = [st['dominant_direction'] for st in shift_trends]
+                
+                if all('右移' in d for d in dominant_dirs):
+                    multi_comparison['summary']['behavior_patterns'].append(
+                        f'与过去{comparison_days}天相比，负荷阶段持续右移(推迟)，说明作息时间逐渐推迟，可能是周末/假日效应、或生活习惯改变'
+                    )
+                elif all('左移' in d for d in dominant_dirs):
+                    multi_comparison['summary']['behavior_patterns'].append(
+                        f'与过去{comparison_days}天相比，负荷阶段持续左移(提前)，说明作息时间逐渐提前，可能是工作日效应、或早起习惯养成'
+                    )
+                else:
+                    multi_comparison['summary']['behavior_patterns'].append(
+                        f'与过去{comparison_days}天相比，负荷阶段时间偏移方向不一致，说明作息时间有波动，用电模式不稳定'
+                    )
+            
+            # 5. 负荷水平变化趋势
+            if multi_comparison['summary']['load_trends']:
+                load_trends = multi_comparison['summary']['load_trends']
+                
+                # 计算整体负荷增减趋势
+                total_increases = sum(lt['increase_count'] for lt in load_trends)
+                total_decreases = sum(lt['decrease_count'] for lt in load_trends)
+                
+                if total_increases > total_decreases * 1.5:
+                    multi_comparison['summary']['behavior_patterns'].append(
+                        f'与历史时期相比，负荷整体呈上升趋势，可能原因：在家时间增加、新增用电设备、季节性需求上升'
+                    )
+                elif total_decreases > total_increases * 1.5:
+                    multi_comparison['summary']['behavior_patterns'].append(
+                        f'与历史时期相比，负荷整体呈下降趋势，可能原因：外出时间增加、节能措施实施、季节性需求下降'
+                    )
+                else:
+                    multi_comparison['summary']['behavior_patterns'].append(
+                        f'与历史时期相比，负荷增减较为平衡，用电水平相对稳定'
+                    )
+        
+        return multi_comparison
+        
+    except Exception as e:
+        print(f"❌ 多历史时期对比分析失败: {e}")
+        import traceback
+        traceback.print_exc()
+        return {
+            'comparison_days': comparison_days,
+            'comparisons': {},
+            'summary': {},
+            'error': str(e)
+        }
+
 def generate_explanation_report(explanations, output_path):
     """
     生成负荷变化可解释性报告（文本格式）
