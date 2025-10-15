@@ -88,15 +88,44 @@ def generate_demo_data(date_str, seed=42, scenario='normal'):
     return df
 
 def simple_segmentation(load_values, n_segments=4):
-    """简单的负荷分段方法（基于分位数）"""
+    """
+    简单的负荷分段方法（基于分位数）
+    增强版：使用时间特征的正余弦编码让时间成为连续的
+    """
     load_values = np.array(load_values)
+    n = len(load_values)
+    
+    # 构建时间特征（正余弦编码让时间成为连续的）
+    time_features = []
+    for i in range(n):
+        hour = (i * 0.25) % 24  # 假设15分钟间隔
+        time_features.append([
+            np.sin(2 * np.pi * hour / 24),  # 小时的正弦编码
+            np.cos(2 * np.pi * hour / 24),  # 小时的余弦编码
+            np.sin(2 * np.pi * (i % 96) / 96),  # 日内位置编码
+            np.cos(2 * np.pi * (i % 96) / 96)
+        ])
+    time_features = np.array(time_features)
+    
+    # 归一化负荷值
+    load_normalized = (load_values - load_values.min()) / (load_values.max() - load_values.min() + 1e-10)
     
     # 计算分位数阈值
     quantiles = np.linspace(0, 1, n_segments + 1)
     thresholds = np.quantile(load_values, quantiles)
     
-    # 分配状态
+    # 分配状态（考虑时间特征）
     states = np.digitize(load_values, thresholds[1:-1])
+    
+    # 使用时间特征优化状态边界
+    for i in range(1, n - 1):
+        if states[i] != states[i-1]:
+            # 计算时间相似度
+            time_sim_prev = np.dot(time_features[i], time_features[i-1])
+            
+            # 如果时间特征变化不显著，且负荷差异小，则合并状态
+            if time_sim_prev > 0.95 and abs(load_normalized[i] - load_normalized[i-1]) < 0.1:
+                states[i] = states[i-1]
     
     # 计算每个状态的平均值
     state_means = []
