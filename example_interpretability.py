@@ -89,6 +89,7 @@ def segment_load_by_threshold(load_values, n_segments=4, min_segment_length=6):
     基于负荷水平进行改进的智能分段
     
     使用时间序列平滑、变化点检测和最小段长度约束来创建更精准的阶段划分。
+    增强版：使用时间特征的正余弦编码让时间成为连续的
     
     Args:
         load_values: 负荷值数组
@@ -100,6 +101,18 @@ def segment_load_by_threshold(load_values, n_segments=4, min_segment_length=6):
     """
     load_values = np.array(load_values)
     n = len(load_values)
+    
+    # 构建时间特征（正余弦编码让时间成为连续的）
+    time_features = []
+    for i in range(n):
+        hour = (i * 0.25) % 24  # 假设15分钟间隔
+        time_features.append([
+            np.sin(2 * np.pi * hour / 24),  # 小时的正弦编码
+            np.cos(2 * np.pi * hour / 24),  # 小时的余弦编码
+            np.sin(2 * np.pi * (i % 96) / 96),  # 日内位置编码
+            np.cos(2 * np.pi * (i % 96) / 96)
+        ])
+    time_features = np.array(time_features)
     
     # 步骤1: 对负荷值进行平滑处理，减少噪声影响
     # 使用移动平均窗口大小为5（约1小时）
@@ -126,10 +139,23 @@ def segment_load_by_threshold(load_values, n_segments=4, min_segment_length=6):
             (derivative[i] * derivative[i-1] < 0 or abs(derivative[i]) > abs(derivative[i-1]) * 1.5)):
             change_points.append(i)
     
-    # 步骤4: 基于变化点和负荷水平进行聚类分段
+    # 归一化负荷值以便与时间特征结合
+    load_normalized = (smoothed_load - smoothed_load.min()) / (smoothed_load.max() - smoothed_load.min() + 1e-10)
+    
+    # 步骤4: 基于变化点和负荷水平进行聚类分段（结合时间特征）
     # 使用K-means思想对平滑后的负荷进行聚类
     thresholds = np.percentile(smoothed_load, np.linspace(0, 100, n_segments + 1))
     states = np.digitize(smoothed_load, thresholds[1:-1])
+    
+    # 使用时间特征优化状态边界
+    for i in range(1, n - 1):
+        if states[i] != states[i-1]:
+            # 计算时间相似度
+            time_sim_prev = np.dot(time_features[i], time_features[i-1])
+            
+            # 如果时间特征变化不显著，且负荷差异小，则合并状态
+            if time_sim_prev > 0.95 and abs(load_normalized[i] - load_normalized[i-1]) < 0.1:
+                states[i] = states[i-1]
     
     # 步骤5: 识别初始段
     initial_segments = []

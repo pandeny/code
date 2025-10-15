@@ -2038,20 +2038,57 @@ def simple_load_segmentation(load_values, n_segments=4, min_segment_length=8):
     """
     简单的负荷分段方法（作为HMM的备选方案）
     基于负荷水平的分位数进行分段，并合并短段
+    增强版：使用时间特征的正余弦编码让时间成为连续的
     """
     try:
         load_values = np.array(load_values)
+        n = len(load_values)
         
         # 对数据进行轻微平滑，减少噪声
         from scipy import ndimage
         smoothed_values = ndimage.median_filter(load_values.astype(float), size=3)
         
-        # 计算分位数阈值
-        quantiles = np.linspace(0, 1, n_segments + 1)
-        thresholds = np.quantile(smoothed_values, quantiles)
+        # 构建时间特征（正余弦编码让时间成为连续的）
+        time_features = []
+        for i in range(n):
+            hour = (i * 0.25) % 24  # 假设15分钟间隔
+            time_features.append([
+                np.sin(2 * np.pi * hour / 24),  # 小时的正弦编码
+                np.cos(2 * np.pi * hour / 24),  # 小时的余弦编码
+                np.sin(2 * np.pi * (i % 96) / 96),  # 日内位置编码
+                np.cos(2 * np.pi * (i % 96) / 96)
+            ])
+        time_features = np.array(time_features)
         
-        # 分配状态
-        raw_states = np.digitize(smoothed_values, thresholds[1:-1])
+        # 结合负荷值和时间特征进行聚类
+        # 归一化负荷值以便与时间特征结合
+        load_normalized = (smoothed_values - smoothed_values.min()) / (smoothed_values.max() - smoothed_values.min() + 1e-10)
+        
+        # 组合特征：负荷值权重更高（占70%），时间特征占30%
+        combined_features = np.column_stack([
+            load_normalized * 0.7,
+            time_features * 0.3
+        ])
+        
+        # 计算分位数阈值（基于归一化负荷）
+        quantiles = np.linspace(0, 1, n_segments + 1)
+        thresholds = np.quantile(load_normalized, quantiles)
+        
+        # 分配状态（考虑时间特征）
+        raw_states = np.digitize(load_normalized, thresholds[1:-1])
+        
+        # 微调：使用时间特征进行边界优化
+        # 在状态边界处，如果时间特征显示应该是不同阶段（如从夜间到早晨），则倾向于切分
+        for i in range(1, n - 1):
+            if raw_states[i] != raw_states[i-1]:
+                # 计算时间相似度
+                time_sim_prev = np.dot(time_features[i], time_features[i-1])
+                time_sim_next = np.dot(time_features[i], time_features[i+1]) if i+1 < n else time_sim_prev
+                
+                # 如果时间特征变化显著（相似度低），保持状态切换
+                # 否则，考虑是否应该保持同一状态
+                if time_sim_prev > 0.95 and abs(load_normalized[i] - load_normalized[i-1]) < 0.1:
+                    raw_states[i] = raw_states[i-1]  # 合并到前一个状态
         
         # 应用滑动窗口平滑状态序列
         window_size = 5
