@@ -2037,125 +2037,173 @@ def visualize_explanations(explanations, output_path):
 def simple_load_segmentation(load_values, n_segments=4, min_segment_length=8):
     """
     简单的负荷分段方法（作为HMM的备选方案）
-    基于负荷水平的分位数进行分段，并合并短段
-    增强版：使用时间特征的正余弦编码让时间成为连续的，并检测负荷峰值/波动区作为窗口划分阶段
+    基于峰值检测和负荷水平变化，准确识别负荷活跃期
+    改进版：结合峰值检测和变化点检测，更准确地划分活跃/非活跃期
     """
     try:
         load_values = np.array(load_values)
         n = len(load_values)
         
-        # 对数据进行轻微平滑，减少噪声
+        # Step 1: 对数据进行平滑处理
         from scipy import ndimage
-        smoothed_values = ndimage.median_filter(load_values.astype(float), size=3)
+        smoothed_values = ndimage.gaussian_filter1d(load_values.astype(float), sigma=2)
         
-        # 构建时间特征（正余弦编码让时间成为连续的）
-        features = []
-        time_features = []
-        for i in range(n):
-            hour = (i * 0.25) % 24  # 假设15分钟间隔
-            time_features.append([
-                np.sin(2 * np.pi * hour / 24),  # 小时的正弦编码
-                np.cos(2 * np.pi * hour / 24),  # 小时的余弦编码
-                np.sin(2 * np.pi * (i % 96) / 96),  # 日内位置编码
-                np.cos(2 * np.pi * (i % 96) / 96)
-            ])
-        features.append(np.array(time_features))
-        time_features = features[0]  # 提取时间特征数组
-        
-        # 检测负荷峰值/波动区域
-        # 计算局部峰值（高负荷区）
+        # Step 2: 检测峰值区域（高负荷活跃期）
         window_size = 8  # 2小时窗口
         peak_zones = []
-        fluctuation_zones = []
+        valley_zones = []
         
         for i in range(window_size, n - window_size):
             window = smoothed_values[i-window_size:i+window_size]
             center_val = smoothed_values[i]
             
-            # 峰值检测：当前点是局部最大值
-            if center_val == np.max(window) and center_val > np.percentile(smoothed_values, 75):
+            # 峰值检测：局部最大值且超过75分位数
+            if center_val == np.max(window) and center_val > np.percentile(smoothed_values, 70):
                 peak_zones.append(i)
             
-            # 波动检测：窗口内标准差较大
-            window_std = np.std(window)
-            if window_std > np.std(smoothed_values) * 0.8:
-                fluctuation_zones.append(i)
+            # 谷值检测：局部最小值且低于30分位数
+            if center_val == np.min(window) and center_val < np.percentile(smoothed_values, 30):
+                valley_zones.append(i)
         
-        # 合并相邻的峰值/波动区域，形成窗口边界
-        def merge_zones(zones, min_gap=6):
-            if not zones:
-                return []
-            zones = sorted(set(zones))
-            merged = [zones[0]]
-            for z in zones[1:]:
-                if z - merged[-1] < min_gap:
-                    continue  # 跳过太接近的点
-                merged.append(z)
-            return merged
+        # Step 3: 基于峰值/谷值扩展形成活跃/非活跃区域
+        # 对每个峰值，向两侧扩展直到负荷降低到一定程度
+        def expand_from_peak(peak_idx, smoothed_values, threshold_ratio=0.7):
+            """从峰值向两侧扩展，直到负荷降到峰值的threshold_ratio倍"""
+            peak_value = smoothed_values[peak_idx]
+            threshold = peak_value * threshold_ratio
+            
+            # 向左扩展
+            start = peak_idx
+            while start > 0 and smoothed_values[start] > threshold:
+                start -= 1
+            
+            # 向右扩展
+            end = peak_idx
+            while end < len(smoothed_values) - 1 and smoothed_values[end] > threshold:
+                end += 1
+            
+            return start, end
         
-        peak_boundaries = merge_zones(peak_zones)
-        fluctuation_boundaries = merge_zones(fluctuation_zones)
+        # 为每个峰值创建活跃区域
+        active_regions = []
+        for peak_idx in peak_zones:
+            start, end = expand_from_peak(peak_idx, smoothed_values, threshold_ratio=0.65)
+            active_regions.append((start, end))
         
-        # 结合峰值和波动边界
-        important_boundaries = sorted(set(peak_boundaries + fluctuation_boundaries))
+        # 合并重叠的活跃区域
+        if active_regions:
+            active_regions = sorted(active_regions)
+            merged_active = [active_regions[0]]
+            for start, end in active_regions[1:]:
+                if start <= merged_active[-1][1] + 4:  # 允许4个点(1小时)的间隙
+                    merged_active[-1] = (merged_active[-1][0], max(merged_active[-1][1], end))
+                else:
+                    merged_active.append((start, end))
+            active_regions = merged_active
         
-        # 归一化负荷值以便与时间特征结合
-        load_normalized = (smoothed_values - smoothed_values.min()) / (smoothed_values.max() - smoothed_values.min() + 1e-10)
-        
-        # 组合特征：负荷值权重更高（占70%），时间特征占30%
-        combined_features = np.column_stack([
-            load_normalized * 0.7,
-            time_features * 0.3
-        ])
-        
-        # 计算分位数阈值（基于归一化负荷）
-        quantiles = np.linspace(0, 1, n_segments + 1)
-        thresholds = np.quantile(load_normalized, quantiles)
-        
-        # 分配状态（考虑时间特征和重要边界）
-        raw_states = np.digitize(load_normalized, thresholds[1:-1])
-        
-        # 在重要边界处强制分割，确保峰值/波动区作为独立阶段
-        for boundary in important_boundaries:
-            if 0 < boundary < n-1:
-                # 检查边界前后的负荷变化
-                load_change = abs(load_normalized[boundary] - load_normalized[boundary-1])
-                if load_change > 0.15:  # 显著变化
-                    # 标记边界，后续状态边界优化时会保留
-                    raw_states[boundary] = max(0, raw_states[boundary])
-        
-        # 微调：使用时间特征进行边界优化，同时保持峰值/波动区的独立性
-        for i in range(1, n - 1):
-            if raw_states[i] != raw_states[i-1]:
-                # 如果在重要边界附近，保持分割
-                near_boundary = any(abs(i - b) < 3 for b in important_boundaries)
-                if near_boundary:
-                    continue  # 保持边界
+        # Step 4: 基于活跃区域创建段落
+        # 如果没有检测到活跃区域，使用分位数方法
+        if not active_regions:
+            # 回退到简单的分位数分段
+            quantiles = np.linspace(0, 1, n_segments + 1)
+            thresholds = np.quantile(smoothed_values, quantiles)
+            states = np.digitize(smoothed_values, thresholds[1:-1])
+            
+            # 识别连续段
+            segments = []
+            current_state = states[0]
+            start_idx = 0
+            
+            for i in range(1, n):
+                if states[i] != current_state:
+                    segment_load = np.mean(load_values[start_idx:i])
+                    segments.append((start_idx, i - 1, current_state, segment_load))
+                    start_idx = i
+                    current_state = states[i]
+            
+            segment_load = np.mean(load_values[start_idx:])
+            segments.append((start_idx, n - 1, current_state, segment_load))
+        else:
+            # 基于活跃区域创建段落
+            segments = []
+            current_pos = 0
+            
+            for region_start, region_end in active_regions:
+                # 如果活跃区域前有间隙，创建非活跃段
+                if current_pos < region_start:
+                    segment_load = np.mean(load_values[current_pos:region_start])
+                    segments.append((current_pos, region_start - 1, 0, segment_load))  # 状态0=低负荷
                 
-                # 计算时间相似度
-                time_sim_prev = np.dot(time_features[i], time_features[i-1])
-                time_sim_next = np.dot(time_features[i], time_features[i+1]) if i+1 < n else time_sim_prev
+                # 创建活跃段
+                segment_load = np.mean(load_values[region_start:region_end + 1])
+                segments.append((region_start, region_end, 1, segment_load))  # 状态1=高负荷
                 
-                # 如果时间特征变化显著（相似度低），保持状态切换
-                # 否则，考虑是否应该保持同一状态
-                if time_sim_prev > 0.95 and abs(load_normalized[i] - load_normalized[i-1]) < 0.1:
-                    raw_states[i] = raw_states[i-1]  # 合并到前一个状态
+                current_pos = region_end + 1
+            
+            # 最后的非活跃段
+            if current_pos < n:
+                segment_load = np.mean(load_values[current_pos:n])
+                segments.append((current_pos, n - 1, 0, segment_load))
         
-        # 应用滑动窗口平滑状态序列
-        window_size = 5
-        smoothed_states = np.zeros_like(raw_states)
-        for i in range(len(raw_states)):
-            start = max(0, i - window_size // 2)
-            end = min(len(raw_states), i + window_size // 2 + 1)
-            window = raw_states[start:end]
-            # 使用众数作为平滑后的状态
-            from scipy import stats
-            smoothed_states[i] = int(stats.mode(window)[0])
+        # Step 5: 根据负荷水平细分段落为n_segments个等级
+        segment_loads = np.array([seg[3] for seg in segments])
         
-        # 计算每个状态的平均值
+        if len(segments) >= n_segments:
+            # 使用分位数对负荷进行分级
+            quantiles = np.linspace(0, 1, n_segments + 1)
+            thresholds = np.quantile(segment_loads, quantiles)
+            new_states = np.digitize(segment_loads, thresholds[1:-1])
+        else:
+            # 段落数少于目标，按负荷排序分配状态
+            sorted_indices = np.argsort(segment_loads)
+            new_states = np.zeros(len(segment_loads), dtype=int)
+            for rank, idx in enumerate(sorted_indices):
+                new_states[idx] = min(rank, n_segments - 1)
+        
+        # 更新段落状态
+        classified_segments = []
+        for i, (start, end, _, load) in enumerate(segments):
+            classified_segments.append((start, end, new_states[i], load))
+        
+        # Step 6: 合并相邻的相似段落
+        merged_segments = []
+        i = 0
+        while i < len(classified_segments):
+            start_idx, end_idx, state, mean_load = classified_segments[i]
+            
+            # 尝试与后续段落合并
+            while i + 1 < len(classified_segments):
+                next_start, next_end, next_state, next_load = classified_segments[i + 1]
+                
+                # 合并条件：状态相同或相邻，且负荷水平相似
+                load_diff_pct = abs(next_load - mean_load) / (mean_load + 1e-6) * 100
+                state_diff = abs(next_state - state)
+                
+                if state_diff <= 1 and load_diff_pct < 25:  # 放宽到25%
+                    end_idx = next_end
+                    combined_load = np.mean(load_values[start_idx:end_idx + 1])
+                    mean_load = combined_load
+                    state = max(state, next_state)  # 取较高的状态
+                    i += 1
+                else:
+                    break
+            
+            merged_segments.append((start_idx, end_idx, state, mean_load))
+            i += 1
+        
+        # Step 7: 确保最小段落长度
+        final_segments = merge_short_segments(merged_segments, load_values, min_segment_length)
+        
+        # Step 8: 重新构建状态序列和计算状态均值
+        final_states = np.zeros(n, dtype=int)
+        for start_idx, end_idx, state, _ in final_segments:
+            final_states[start_idx:end_idx + 1] = state
+        
+        # 计算每个状态的平均负荷
+        unique_states = sorted(set([seg[2] for seg in final_segments]))
         state_means = []
-        for state in range(n_segments):
-            state_mask = (smoothed_states == state)
+        for state in unique_states:
+            state_mask = (final_states == state)
             if np.any(state_mask):
                 state_mean = np.mean(load_values[state_mask])
                 state_means.append(state_mean)
@@ -2164,45 +2212,7 @@ def simple_load_segmentation(load_values, n_segments=4, min_segment_length=8):
         
         state_means = np.array(state_means)
         
-        # 识别初始连续段
-        initial_segments = []
-        current_state = smoothed_states[0]
-        start_idx = 0
-        
-        for i in range(1, len(smoothed_states)):
-            if smoothed_states[i] != current_state:
-                end_idx = i - 1
-                segment_load = np.mean(load_values[start_idx:i])
-                initial_segments.append((start_idx, end_idx, current_state, segment_load))
-                start_idx = i
-                current_state = smoothed_states[i]
-        
-        # 添加最后一段
-        segment_load = np.mean(load_values[start_idx:])
-        initial_segments.append((start_idx, len(smoothed_states) - 1, current_state, segment_load))
-        
-        # 合并短段
-        merged_segments = merge_short_segments(initial_segments, load_values, min_segment_length)
-        
-        # 重新构建状态序列
-        final_states = np.zeros_like(smoothed_states)
-        for start_idx, end_idx, state, _ in merged_segments:
-            final_states[start_idx:end_idx+1] = state
-        
-        # 重新计算状态平均值
-        final_state_means = []
-        unique_states = sorted(set([seg[2] for seg in merged_segments]))
-        for state in unique_states:
-            state_mask = (final_states == state)
-            if np.any(state_mask):
-                state_mean = np.mean(load_values[state_mask])
-                final_state_means.append(state_mean)
-            else:
-                final_state_means.append(np.mean(load_values))
-        
-        final_state_means = np.array(final_state_means)
-        
-        return final_states, final_state_means, merged_segments
+        return final_states, state_means, final_segments
         
     except Exception as e:
         print(f"❌ 简单分段也失败: {e}")
